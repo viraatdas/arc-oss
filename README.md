@@ -47,8 +47,8 @@ over from Arc.
 Radian needs macOS 14 or later and Xcode 16 or later (or a Swift 6 toolchain).
 
 ```sh
-git clone https://github.com/viraatdas/arc-os.git
-cd arc-os
+git clone https://github.com/viraatdas/arc-oss.git
+cd arc-oss
 scripts/bundle.sh          # builds build/Radian.app
 open build/Radian.app
 ```
