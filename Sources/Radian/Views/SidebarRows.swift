@@ -9,15 +9,13 @@ extension UTType {
     static let radianSidebarItem = UTType(exportedAs: "io.github.viraatdas.radian.sidebar-item")
 }
 
-/// What a sidebar row puts on the drag pasteboard: its id, which only Radian can read, and for a
-/// tab its address, so dropping it on another app or on a page gives that app the link.
+/// What a sidebar row puts on the drag pasteboard: its id under Radian's own type, which nothing
+/// else reads, and for a tab its address, so dropping it on another app or a page gives the link.
 func dragProvider(for item: SidebarItem) -> NSItemProvider {
-    let provider = NSItemProvider()
-    let id = Data(item.id.uuidString.utf8)
-    provider.registerDataRepresentation(forTypeIdentifier: UTType.radianSidebarItem.identifier, visibility: .ownProcess) { completion in
-        completion(id, nil)
-        return nil
-    }
+    let provider = NSItemProvider(
+        item: Data(item.id.uuidString.utf8) as NSData,
+        typeIdentifier: UTType.radianSidebarItem.identifier
+    )
     if !item.isFolder, let url = item.url ?? item.homeURL {
         provider.registerObject(url as NSURL, visibility: .all)
     }
