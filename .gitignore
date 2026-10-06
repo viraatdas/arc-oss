@@ -1,0 +1,15 @@
+.rudder/
+.rudder-workspaces/
+.rudder-worktrees/
+RUDDER.md
+RUDDER_SHARED.md
+
+# Build output
+.build/
+build/
+.swiftpm/
+DerivedData/
+
+# Local tool output
+.offstage/
+.DS_Store
