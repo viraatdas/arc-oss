@@ -33,17 +33,44 @@ public struct JSONFileStore<Value: Codable>: Sendable {
         return try decoder.decode(Value.self, from: Data(contentsOf: url))
     }
 
-    /// Like `load`, but a file that cannot be decoded is moved aside instead of throwing, so one
-    /// bad write never locks the user out and the old data stays recoverable.
-    public func loadOrQuarantine() -> Value? {
-        do {
-            return try load()
-        } catch {
-            let stamp = Int(Date().timeIntervalSince1970)
-            let quarantine = url.deletingPathExtension().appendingPathExtension("corrupt-\(stamp).json")
-            try? FileManager.default.moveItem(at: url, to: quarantine)
+    public enum LoadResult {
+        case loaded(Value)
+        /// There was no file yet.
+        case missing
+        /// The file could not be read and was moved to this address, where it is kept untouched.
+        case setAside(URL)
+
+        public var value: Value? {
+            if case .loaded(let value) = self { return value }
             return nil
         }
+    }
+
+    /// Like `load`, but a file that cannot be decoded is moved aside instead of throwing, so one
+    /// bad write never locks the user out and the old data stays recoverable.
+    public func loadOrSetAside() -> LoadResult {
+        do {
+            return try load().map(LoadResult.loaded) ?? .missing
+        } catch {
+            let stamp = Int(Date().timeIntervalSince1970)
+            let destination = url.deletingPathExtension().appendingPathExtension("unreadable-\(stamp).json")
+            let fileManager = FileManager.default
+            if (try? fileManager.moveItem(at: url, to: destination)) != nil
+                || (try? fileManager.copyItem(at: url, to: destination)) != nil {
+                return .setAside(destination)
+            }
+            // Neither worked, so the folder cannot be written to and saving will fail the same way:
+            // the file stays where it is, unharmed.
+            return .setAside(url)
+        }
+    }
+
+    /// Copies the file next to itself before something that might overwrite it. Returns the copy.
+    @discardableResult
+    public func backUp(suffix: String) -> URL? {
+        let destination = url.deletingPathExtension().appendingPathExtension("\(suffix).json")
+        try? FileManager.default.removeItem(at: destination)
+        return (try? FileManager.default.copyItem(at: url, to: destination)) != nil ? destination : nil
     }
 
     public func save(_ value: Value) throws {

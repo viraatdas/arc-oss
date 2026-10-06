@@ -139,16 +139,17 @@ extension BrowserStore {
         return matches.sorted { $0.score > $1.score }.map { ($0.item, $0.spaceName) }
     }
 
-    func perform(_ result: CommandResult, mode: CommandBarRequest.Mode) {
+    func perform(_ result: CommandResult, for request: CommandBarRequest) {
+        let mode = request.mode
         dismissCommandBar()
         switch result {
         case .open(let resolution):
-            open(resolution.url, mode: mode)
+            open(resolution.url, mode: mode, target: request.targetTabID)
         case .history(let entry):
-            open(entry.url, mode: mode)
+            open(entry.url, mode: mode, target: request.targetTabID)
         case .switchToTab(let item, _):
             // Only a tab from this space can sit in the split; anything else is a plain switch.
-            if mode == .splitPane, state.visibleTabsIncludingCollapsed(inSpace: state.currentSpaceID).contains(item.id) {
+            if mode == .splitPane, state.reachableTabIDs(inSpace: state.currentSpaceID).contains(item.id) {
                 openInSplit(item.id)
             } else {
                 select(item.id)
@@ -166,40 +167,50 @@ struct CommandBarOverlay: View {
     let request: CommandBarRequest
 
     var body: some View {
-        ZStack(alignment: .top) {
-            Color.black.opacity(0.14)
-                .contentShape(Rectangle())
-                .onTapGesture { store.dismissCommandBar() }
-            CommandBarPanel(request: request)
-                .padding(.top, 130)
-                .padding(.horizontal, 24)
+        GeometryReader { proxy in
+            ZStack(alignment: .top) {
+                Color.black.opacity(0.14)
+                    .contentShape(Rectangle())
+                    .onTapGesture { store.dismissCommandBar() }
+                    .accessibilityHidden(true)
+                CommandBarPanel(request: request, maxListHeight: max(proxy.size.height - topInset - 120, 80))
+                    // A new request starts from scratch, even if the bar was already showing.
+                    .id(request.id)
+                    .padding(.top, topInset)
+                    .padding(.horizontal, 24)
+            }
         }
     }
+
+    /// How far below the top of the window the bar sits.
+    private var topInset: CGFloat { 130 }
 }
 
 private struct CommandBarPanel: View {
     @Environment(BrowserStore.self) private var store
     let request: CommandBarRequest
+    let maxListHeight: CGFloat
 
     @State private var query: String
+    @State private var results: [CommandResult] = []
     @State private var selection = 0
 
     private let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
 
-    init(request: CommandBarRequest) {
+    init(request: CommandBarRequest, maxListHeight: CGFloat) {
         self.request = request
+        self.maxListHeight = maxListHeight
         _query = State(initialValue: request.initialText)
     }
 
     var body: some View {
-        let results = store.commandResults(for: query)
-
         VStack(spacing: 0) {
             HStack(spacing: 12) {
                 Image(systemName: symbol)
                     .font(.system(size: 16, weight: .medium))
                     .foregroundStyle(.secondary)
                     .frame(width: 20)
+                    .accessibilityHidden(true)
                 CommandField(
                     text: $query,
                     placeholder: placeholder,
@@ -210,7 +221,7 @@ private struct CommandBarPanel: View {
                     },
                     onSubmit: {
                         guard results.indices.contains(selection) else { return }
-                        store.perform(results[selection], mode: request.mode)
+                        store.perform(results[selection], for: request)
                     },
                     onCancel: { store.dismissCommandBar() }
                 )
@@ -220,20 +231,52 @@ private struct CommandBarPanel: View {
 
             if !results.isEmpty {
                 Divider()
-                VStack(spacing: 2) {
-                    ForEach(Array(results.enumerated()), id: \.element.id) { index, result in
-                        CommandRow(result: result, isSelected: index == selection)
-                            .onTapGesture { store.perform(result, mode: request.mode) }
-                    }
+                // As tall as its rows, up to the room the window has; past that it scrolls and
+                // keeps the highlighted row in view.
+                ScrollViewReader { proxy in
+                    ScrollView { rows }
+                        .scrollDisabled(listHeight >= contentHeight)
+                        .onChange(of: selection) { _, index in
+                            if results.indices.contains(index) { proxy.scrollTo(results[index].id) }
+                        }
                 }
-                .padding(6)
+                .frame(height: listHeight)
             }
         }
         .frame(maxWidth: 640)
         .background(.regularMaterial, in: shape)
         .overlay(shape.strokeBorder(.primary.opacity(0.12)))
         .shadow(color: .black.opacity(0.3), radius: 30, y: 14)
-        .onChange(of: query) { selection = 0 }
+        // Ranking runs once per keystroke, not on every redraw of the window behind the bar.
+        .onAppear { results = store.commandResults(for: query) }
+        .onChange(of: query) {
+            results = store.commandResults(for: query)
+            selection = 0
+        }
+    }
+
+    static let rowHeight: CGFloat = 38
+    private static let rowSpacing: CGFloat = 2
+    private static let listPadding: CGFloat = 6
+
+    private var contentHeight: CGFloat {
+        let count = CGFloat(results.count)
+        return count * Self.rowHeight + max(count - 1, 0) * Self.rowSpacing + 2 * Self.listPadding
+    }
+
+    private var listHeight: CGFloat { min(contentHeight, maxListHeight) }
+
+    private var rows: some View {
+        VStack(spacing: Self.rowSpacing) {
+            ForEach(Array(results.enumerated()), id: \.element.id) { index, result in
+                Button { store.perform(result, for: request) } label: {
+                    CommandRow(result: result, isSelected: index == selection)
+                }
+                .buttonStyle(.plain)
+                .id(result.id)
+            }
+        }
+        .padding(Self.listPadding)
     }
 
     private var symbol: String {
@@ -278,7 +321,9 @@ private struct CommandRow: View {
                 .fixedSize()
         }
         .padding(.horizontal, 11)
-        .frame(height: 38)
+        .frame(height: CommandBarPanel.rowHeight)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
         .background(
             RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .fill(isSelected ? Color.accentColor.opacity(0.2) : .clear)
@@ -366,6 +411,8 @@ private struct CommandField: NSViewRepresentable {
 
     func updateNSView(_ field: FocusingTextField, context: Context) {
         context.coordinator.parent = self
+        field.placeholderString = placeholder
+        field.selectsAllOnFocus = selectsAllOnFocus
         if field.stringValue != text {
             field.stringValue = text
         }

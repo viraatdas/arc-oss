@@ -26,17 +26,23 @@ over from Arc.
 - **Favorites.** A grid of site icons at the top of the sidebar, shared by every space on a profile.
 - **Pinned tabs and folders.** A pinned tab keeps its home address. Closing it unloads it rather
   than removing it, and you can send it back home or make the current page its new home. Folders
-  nest.
+  nest. Deleting a pinned tab, a folder or a whole space sends its tabs to the archive, so nothing
+  is lost by accident.
 - **Tabs that tidy themselves.** Unpinned tabs you have not looked at in 12 hours move to the
   archive. The interval is adjustable, archiving can be turned off, and `⇧⌘T` or the archive brings
   any tab back.
 - **Command bar.** `⌘T` opens something new and `⌘L` goes somewhere else in the current tab. It
-  tells addresses from searches (`localhost:3000`, `192.168.1.1`, `main.swift`), completes sites you
-  visit often, switches to open tabs, and runs commands.
+  tells addresses from searches using the real list of domain endings (`notion.so` and
+  `devbox:3000` open, `JSON.parse` and `readme.md` search), completes sites you visit often,
+  switches to open tabs, and runs commands.
 - **Split view.** Two tabs side by side (`⌃⇧=`, or "Open in Split View" on any tab).
-- **Drag and drop** between favorites, pinned, folders, tabs and spaces. Rename anything.
-- The rest of a browser: find in page, zoom, downloads, permission prompts, web inspector, and it
-  can be set as the default browser.
+- **Drag and drop** between favorites, pinned tabs, folders and open tabs, or onto a space's icon
+  to move a tab there. Rename tabs, folders, spaces and profiles.
+- The rest of a browser: find in page, zoom, printing, downloads, site logins, camera and
+  microphone prompts, the web inspector, and it can be set as the default browser.
+- **Pages stay in their place.** Pop-ups need a click and open in their own space. Downloads
+  ask once per site. Links that open other apps ask first. A page that keeps showing dialogs can
+  be silenced.
 
 | | |
 | --- | --- |
@@ -75,7 +81,8 @@ Import from Arc.
 
 Arc runs on Chromium and Radian runs on WebKit, the engine behind Safari. Their login storage is
 incompatible, so expect to sign in to sites again. Radian reads Arc's files and never writes to
-them. Importing twice is safe: spaces brought over before are left alone.
+them. Importing again is safe: it only adds what is missing and never duplicates or overwrites
+anything. A space you deleted comes back, which is how to start one over.
 
 ## Keyboard shortcuts
 
@@ -95,6 +102,7 @@ them. Importing twice is safe: spaces brought over before are left alone.
 | Toggle sidebar | `⌘S` |
 | Split view | `⌃⇧=` |
 | Find in page | `⌘F` |
+| Print | `⌘P` |
 | Archive | `⇧⌘A` |
 | New folder / new space | `⌥⌘N` / `⌃⌘N` |
 | Back / forward / reload | `⌘[` / `⌘]` / `⌘R` |
@@ -118,8 +126,9 @@ Sources/
     └── Views/
 ```
 
-State is kept in `~/Library/Application Support/Radian/`. Setting `RADIAN_DATA_DIR` points it
-somewhere else, which keeps development runs away from your real data:
+State is kept in `~/Library/Application Support/Radian/`. If that file ever can't be read, Radian
+keeps it aside untouched, says so, and starts fresh. Setting `RADIAN_DATA_DIR` points it somewhere
+else, which keeps development runs away from your real data:
 
 ```sh
 swift test                                            # unit tests
@@ -134,14 +143,16 @@ RADIAN_DATA_DIR=/tmp/radian-shot .build/debug/Radian --snapshot out.png \
   --import-arc path/to/StorableSidebar.json --select 7 --command-bar
 ```
 
-Run `.build/debug/Radian --snapshot` with no other arguments to see every option in
-`Sources/Radian/Snapshot.swift`.
+Run `.build/debug/Radian --snapshot` with no other arguments to see every option.
+
+`scripts/update-tlds.sh` refreshes the list of domain endings from IANA.
 
 ## Not there yet
 
 Radian is young. Compared with Arc it has no sync between Macs, no Chrome extensions (WebKit
-cannot run them), no Little Arc windows, no peek previews, no Boosts, no AI
-features, and one window per app. Contributions are welcome. Please keep
+cannot run them), no Little Arc windows, no peek previews, no Boosts, no AI features, no
+downloads list, and one window per app. Site icons are only fetched over https and SVG icons are
+skipped, so some sites show a globe. Contributions are welcome. Please keep
 `RadianCore` free of UI code and add tests alongside changes to it.
 
 ## License

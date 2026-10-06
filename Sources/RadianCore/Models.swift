@@ -52,9 +52,27 @@ public struct SpaceTheme: Codable, Hashable, Sendable {
         return stops.count == 1 ? [stops[0], stops[0]] : stops
     }
 
-    public var averageLuminance: Double {
+    /// The gradient's color at `position`, from 0 (top left) to 1 (bottom right).
+    public func color(at position: Double) -> RGBAColor {
         let stops = gradientStops
-        return stops.map(\.luminance).reduce(0, +) / Double(stops.count)
+        let scaled = min(max(position, 0), 1) * Double(stops.count - 1)
+        let index = min(Int(scaled), stops.count - 2)
+        let fraction = scaled - Double(index)
+        let from = stops[index], to = stops[index + 1]
+        func mix(_ a: Double, _ b: Double) -> Double { a + (b - a) * fraction }
+        return RGBAColor(
+            red: mix(from.red, to.red),
+            green: mix(from.green, to.green),
+            blue: mix(from.blue, to.blue),
+            alpha: mix(from.alpha, to.alpha)
+        )
+    }
+
+    /// Brightness of the stretch of gradient behind the sidebar. The gradient runs diagonally
+    /// across the whole window and the sidebar covers its top-left end, so later stops count less.
+    public var sidebarLuminance: Double {
+        let samples = [0.0, 0.15, 0.3, 0.45]
+        return samples.map { color(at: $0).luminance }.reduce(0, +) / Double(samples.count)
     }
 
     public static let presets: [SpaceTheme] = [
@@ -281,5 +299,82 @@ public struct Settings: Codable, Equatable, Sendable {
         // Written even when nil: an absent key means "use the default", null means "never archive".
         try container.encode(archiveAfterHours, forKey: .archiveAfterHours)
         try container.encode(sidebarWidth, forKey: .sidebarWidth)
+    }
+}
+
+// MARK: - Decoding
+
+extension RGBAColor {
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            red: try container.decode(Double.self, forKey: .red),
+            green: try container.decode(Double.self, forKey: .green),
+            blue: try container.decode(Double.self, forKey: .blue),
+            alpha: container.value(.alpha, or: 1)
+        )
+    }
+}
+
+extension SpaceTheme {
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        // Through the main initializer, so stored themes get the same limits as new ones.
+        self.init(colors: container.lossyArray(.colors), intensity: container.value(.intensity, or: 0.6))
+    }
+}
+
+extension SidebarItem {
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        // Without these two the item means nothing, so it is skipped rather than guessed at. An
+        // unknown kind is most likely a newer version's, and turning it into a tab would be wrong.
+        id = try container.decode(UUID.self, forKey: .id)
+        kind = try container.decode(Kind.self, forKey: .kind)
+        title = container.value(.title, or: "")
+        customTitle = container.optional(.customTitle)
+        url = container.optional(.url)
+        homeURL = container.optional(.homeURL)
+        children = container.lossyArray(.children)
+        isExpanded = container.value(.isExpanded, or: false)
+        createdAt = container.value(.createdAt, or: Date())
+        // A missing timestamp must not make the tab look stale and get it archived.
+        lastActiveAt = container.value(.lastActiveAt, or: Date())
+    }
+}
+
+extension Profile {
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = container.value(.name, or: "Profile")
+        favorites = container.lossyArray(.favorites)
+    }
+}
+
+extension Space {
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = container.value(.name, or: "Space")
+        icon = container.value(.icon, or: .symbol("circle.fill"))
+        theme = container.value(.theme, or: SpaceTheme.presets[0])
+        // An unknown profile is reassigned to the first one by `BrowserState.repair()`.
+        profileID = container.value(.profileID, or: UUID())
+        pinned = container.lossyArray(.pinned)
+        tabs = container.lossyArray(.tabs)
+        selectedTabID = container.optional(.selectedTabID)
+        splitTabID = container.optional(.splitTabID)
+    }
+}
+
+extension ArchivedTab {
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = container.value(.id, or: UUID())
+        title = container.value(.title, or: "")
+        url = try container.decode(URL.self, forKey: .url)
+        spaceID = container.value(.spaceID, or: UUID())
+        archivedAt = container.value(.archivedAt, or: Date())
     }
 }

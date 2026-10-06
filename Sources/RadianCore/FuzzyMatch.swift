@@ -26,7 +26,9 @@ public enum FuzzyMatch {
     }
 
     private static func singleScore(needle: [Character], haystack: [Character]) -> Int? {
-        guard needle.count <= haystack.count else { return nil }
+        // Both kinds of match keep the query's characters in order, so this one pass rejects most
+        // candidates before the more expensive work below.
+        guard needle.count <= haystack.count, isSubsequence(needle, of: haystack) else { return nil }
         if let range = firstRange(of: needle, in: haystack) {
             var score = 1000 - min(range.lowerBound, 200) * 2
             if range.lowerBound == 0 {
@@ -70,6 +72,15 @@ public enum FuzzyMatch {
             }
         }
         return nil
+    }
+
+    private static func isSubsequence(_ needle: [Character], of haystack: [Character]) -> Bool {
+        var remaining = needle[...]
+        for character in haystack where character == remaining.first {
+            remaining = remaining.dropFirst()
+            if remaining.isEmpty { return true }
+        }
+        return remaining.isEmpty
     }
 
     private static func isWordStart(_ text: [Character], _ index: Int) -> Bool {

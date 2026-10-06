@@ -97,9 +97,11 @@ public enum ArcImporter {
             let key = profileKey(from: raw["profile"])
             noteProfile(key)
 
-            let containerIDs = raw["containerIDs"] as? [Any] ?? []
-            let pinnedID = value(after: "pinned", in: containerIDs)
-            let unpinnedID = value(after: "unpinned", in: containerIDs)
+            // Older files have only `containerIDs`; newer ones add `newContainerIDs`, whose keys
+            // are enum values such as {"unpinned": {...}} rather than plain strings.
+            let containerLists = [raw["containerIDs"], raw["newContainerIDs"]].compactMap { $0 as? [Any] }
+            let pinnedID = containerLists.lazy.compactMap { value(after: "pinned", in: $0) }.first
+            let unpinnedID = containerLists.lazy.compactMap { value(after: "unpinned", in: $0) }.first
             let pinned = pinnedID.map { converter.convert(childrenOf: $0, pinned: true, flatten: false) } ?? []
             let tabs = unpinnedID.map { converter.convert(childrenOf: $0, pinned: false, flatten: true) } ?? []
 
@@ -224,10 +226,13 @@ public enum ArcImporter {
         (value as? [Any] ?? []).compactMap { $0 as? [String: Any] }
     }
 
+    /// In a flat key, value list, the value whose key is `tag`, written either as the string
+    /// itself or as an enum object with `tag` as its only key.
     private static func value(after tag: String, in list: [Any]) -> String? {
-        guard let index = list.firstIndex(where: { ($0 as? String) == tag }), index + 1 < list.count else {
-            return nil
+        let index = list.firstIndex { key in
+            (key as? String) == tag || (key as? [String: Any])?.keys.contains(tag) == true
         }
+        guard let index, index + 1 < list.count else { return nil }
         return list[index + 1] as? String
     }
 
@@ -360,12 +365,25 @@ public struct ArcMergeSummary: Equatable, Sendable {
 }
 
 extension BrowserState {
-    /// Adds imported spaces and favorites. Spaces that were imported before are left untouched, so
-    /// running the import again never clobbers changes made since.
+    /// Adds imported spaces and favorites. Anything already here, under any space or profile, is
+    /// left untouched, so running the import again never duplicates or clobbers what is there.
+    /// Spaces and favorites deleted since the last import do come back.
     @discardableResult
     public mutating func merge(_ imported: ArcImportResult) -> ArcMergeSummary {
         var summary = ArcMergeSummary()
         guard let localDefault = profiles.first?.id else { return summary }
+
+        // An item the user has since moved elsewhere keeps its id, so ids are checked across the
+        // whole state, not just where the item started out.
+        var knownIDs = allItemIDs
+        func unseen(_ items: [SidebarItem]) -> [SidebarItem] {
+            items.compactMap { item in
+                guard knownIDs.insert(item.id).inserted else { return nil }
+                var item = item
+                item.children = unseen(item.children)
+                return item
+            }
+        }
 
         func localProfileID(for importedID: UUID) -> UUID {
             importedID == ArcImporter.defaultProfileID ? localDefault : importedID
@@ -374,14 +392,15 @@ extension BrowserState {
         let neededProfiles = Set(imported.spaces.map(\.profileID))
         for profile in imported.profiles {
             let localID = localProfileID(for: profile.id)
+            let fresh = unseen(profile.favorites)
             if let index = profiles.firstIndex(where: { $0.id == localID }) {
-                let existing = Set(profiles[index].favorites.map(\.id))
-                let fresh = profile.favorites.filter { !existing.contains($0.id) }
                 profiles[index].favorites.append(contentsOf: fresh)
                 summary.addedFavorites += fresh.count
-            } else if neededProfiles.contains(profile.id) || !profile.favorites.isEmpty {
+            } else if neededProfiles.contains(profile.id) || !fresh.isEmpty {
+                var profile = profile
+                profile.favorites = fresh
                 profiles.append(profile)
-                summary.addedFavorites += profile.favorites.count
+                summary.addedFavorites += fresh.count
             }
         }
 
@@ -392,6 +411,8 @@ extension BrowserState {
                 continue
             }
             space.profileID = localProfileID(for: space.profileID)
+            space.pinned = unseen(space.pinned)
+            space.tabs = unseen(space.tabs)
             spaces.append(space)
             summary.addedSpaceIDs.append(space.id)
         }

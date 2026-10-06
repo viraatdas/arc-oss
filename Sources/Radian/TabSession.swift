@@ -15,12 +15,23 @@ final class TabSession: NSObject {
     private(set) var canGoBack = false
     private(set) var canGoForward = false
 
+    /// The sheet currently showing a dialog for this page, if any.
+    @ObservationIgnored private(set) var dialogWindow: NSWindow?
+
     @ObservationIgnored private weak var store: BrowserStore?
     @ObservationIgnored private var observations: [NSKeyValueObservation] = []
     /// Set while the built-in error page is showing, so reload retries the page that failed.
     @ObservationIgnored private var failedURL: URL?
     @ObservationIgnored private var errorPageNavigation: WKNavigation?
-    @ObservationIgnored private var downloadDestinations: [ObjectIdentifier: URL] = [:]
+    /// False until a page actually appears. A tab whose first load turns into a download never
+    /// gets one and is removed.
+    @ObservationIgnored private var hasCommittedNavigation = false
+
+    // Limits on what a page can do to the user. Each resets when a new page loads.
+    @ObservationIgnored private var dialogsShown = 0
+    @ObservationIgnored private var dialogsSuppressed = false
+    @ObservationIgnored private var declinedSchemes: Set<String> = []
+    @ObservationIgnored private var isAskingAboutDownloads = false
 
     init(id: UUID, configuration: WKWebViewConfiguration, store: BrowserStore) {
         self.id = id
@@ -117,13 +128,38 @@ final class TabSession: NSObject {
         return result?.matchFound ?? false
     }
 
+    func printPage() {
+        guard let window = webView.window else { return }
+        let info = NSPrintInfo.shared
+        info.horizontalPagination = .fit
+        info.isHorizontallyCentered = false
+        let operation = webView.printOperation(with: info)
+        // Without a frame WebKit prints blank pages.
+        operation.view?.frame = webView.bounds
+        operation.runModal(for: window, delegate: nil, didRun: nil, contextInfo: nil)
+    }
+
     /// Releases the web view. Its content process exits once nothing else holds it.
     func teardown() {
+        dismissDialog()
         observations.removeAll()
         webView.stopLoading()
         webView.navigationDelegate = nil
         webView.uiDelegate = nil
         webView.removeFromSuperview()
+    }
+
+    /// Closes any dialog this page has open, answering it as Cancel would.
+    func dismissDialog() {
+        guard let sheet = dialogWindow, let parent = sheet.sheetParent else { return }
+        parent.endSheet(sheet, returnCode: .abort)
+    }
+
+    /// A new page is showing, so the limits placed on the previous one no longer apply.
+    private func pageDidChange() {
+        dialogsShown = 0
+        dialogsSuppressed = false
+        declinedSchemes = []
     }
 
     // MARK: - Error page
@@ -169,11 +205,29 @@ final class TabSession: NSObject {
         return host.isEmpty ? "This page" : host
     }
 
-    /// Dialogs attach to the window as sheets. A tab that is not on screen cannot show one, so it
-    /// gets the answer a user would give by dismissing the dialog.
+    /// Shows a sheet on the window. A tab the user cannot see cannot ask anything, so it gets the
+    /// answer a user would give by dismissing the dialog.
     private func present(_ alert: NSAlert) async -> NSApplication.ModalResponse? {
-        guard let window = webView.window, window.isVisible else { return nil }
+        guard let window = webView.window, window.isVisible, dialogWindow == nil else { return nil }
+        dialogWindow = alert.window
+        defer { dialogWindow = nil }
         return await alert.beginSheetModal(for: window)
+    }
+
+    /// Shows a dialog the page asked for with alert(), confirm() or prompt(). From the second
+    /// dialog on, the user can stop the page showing more, which ends a page that loops them.
+    private func presentPageDialog(_ alert: NSAlert) async -> NSApplication.ModalResponse? {
+        guard !dialogsSuppressed else { return nil }
+        dialogsShown += 1
+        if dialogsShown > 1 {
+            alert.showsSuppressionButton = true
+            alert.suppressionButton?.title = "Don’t let this page show more dialogs"
+        }
+        let response = await present(alert)
+        if alert.suppressionButton?.state == .on {
+            dialogsSuppressed = true
+        }
+        return response
     }
 }
 
@@ -186,10 +240,11 @@ extension TabSession: WKNavigationDelegate {
         preferences: WKWebpagePreferences
     ) async -> (WKNavigationActionPolicy, WKWebpagePreferences) {
         guard let url = navigationAction.request.url else { return (.allow, preferences) }
-        if navigationAction.shouldPerformDownload { return (.download, preferences) }
-
+        if navigationAction.shouldPerformDownload {
+            return (await mayDownload(url) ? .download : .cancel, preferences)
+        }
         if !BrowserStore.isWebURL(url) {
-            await offerToOpenExternally(url)
+            await offerToOpenExternally(url, from: navigationAction)
             return (.cancel, preferences)
         }
         if navigationAction.navigationType == .linkActivated, navigationAction.modifierFlags.contains(.command) {
@@ -200,18 +255,25 @@ extension TabSession: WKNavigationDelegate {
         return (.allow, preferences)
     }
 
-    /// Links such as mailto: or zoommtg: launch other apps, so a page never gets to do that silently.
-    private func offerToOpenExternally(_ url: URL) async {
-        guard let handler = NSWorkspace.shared.urlForApplication(toOpen: url) else { return }
+    /// Links such as mailto: or zoommtg: launch other apps, so a page never gets to do that
+    /// silently. Frames inside the page, which are often ads, may not ask at all, and a page
+    /// that was told no once is not allowed to ask again.
+    private func offerToOpenExternally(_ url: URL, from action: WKNavigationAction) async {
+        guard action.sourceFrame.isMainFrame, let scheme = url.scheme?.lowercased(),
+              !declinedSchemes.contains(scheme),
+              let handler = NSWorkspace.shared.urlForApplication(toOpen: url)
+        else { return }
         let appName = FileManager.default.displayName(atPath: handler.path)
         let alert = makeAlert(
             message: "Open this link in \(appName)?",
-            detail: "\(webView.url?.host ?? "This page") wants to open a link that \(appName) handles."
+            detail: "\(pageName(action.sourceFrame)) wants to open a link that \(appName) handles."
         )
         alert.addButton(withTitle: "Open")
         alert.addButton(withTitle: "Cancel")
         if await present(alert) == .alertFirstButtonReturn {
             NSWorkspace.shared.open(url)
+        } else {
+            declinedSchemes.insert(scheme)
         }
     }
 
@@ -219,18 +281,47 @@ extension TabSession: WKNavigationDelegate {
         _ webView: WKWebView,
         decidePolicyFor navigationResponse: WKNavigationResponse
     ) async -> WKNavigationResponsePolicy {
+        var isAttachment = false
         if let response = navigationResponse.response as? HTTPURLResponse,
-           let disposition = response.value(forHTTPHeaderField: "Content-Disposition"),
-           disposition.lowercased().hasPrefix("attachment") {
-            return .download
+           let disposition = response.value(forHTTPHeaderField: "Content-Disposition") {
+            isAttachment = disposition.lowercased().hasPrefix("attachment")
         }
-        return navigationResponse.canShowMIMEType ? .allow : .download
+        guard isAttachment || !navigationResponse.canShowMIMEType else { return .allow }
+        // A frame inside the page cannot start a download by itself.
+        guard navigationResponse.isForMainFrame else { return .cancel }
+        return await mayDownload(navigationResponse.response.url) ? .download : .cancel
+    }
+
+    /// Downloads need the user's go-ahead once per site, and only from a tab they are looking at,
+    /// so a background tab or a looping script cannot fill the Downloads folder.
+    private func mayDownload(_ url: URL?) async -> Bool {
+        guard let store, store.isShowing(id) else { return false }
+        let host = (webView.url ?? url)?.host?.lowercased() ?? ""
+        if store.downloadHosts.contains(host) { return true }
+        guard !isAskingAboutDownloads else { return false }
+        isAskingAboutDownloads = true
+        defer { isAskingAboutDownloads = false }
+
+        let file = url?.lastPathComponent ?? ""
+        let alert = makeAlert(
+            message: "Allow downloads from \(host.isEmpty ? "this page" : host)?",
+            detail: file.isEmpty || file == "/"
+                ? "The page wants to save a file to your Downloads folder."
+                : "The page wants to save “\(file)” to your Downloads folder."
+        )
+        alert.addButton(withTitle: "Allow")
+        alert.addButton(withTitle: "Cancel")
+        guard await present(alert) == .alertFirstButtonReturn else { return false }
+        store.downloadHosts.insert(host)
+        return true
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        hasCommittedNavigation = true
         if navigation !== errorPageNavigation {
             failedURL = nil
             errorPageNavigation = nil
+            pageDidChange()
         }
     }
 
@@ -250,15 +341,64 @@ extension TabSession: WKNavigationDelegate {
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        guard let store, store.isShowing(id) else {
+            // Most likely macOS reclaimed the memory of a tab nobody was looking at. Let it
+            // sleep and load afresh when it is next shown, rather than greet the user with an error.
+            store?.sessionDidCrashOffScreen(id)
+            return
+        }
         // Reloading automatically could loop forever on a page that keeps crashing.
         showErrorPage(for: webView.url, message: "The page stopped unexpectedly.")
     }
 
-    /// Asks the page which icon it declares, preferring one large enough to look sharp.
+    func webView(
+        _ webView: WKWebView,
+        respondTo challenge: URLAuthenticationChallenge
+    ) async -> (URLSession.AuthChallengeDisposition, URLCredential?) {
+        let space = challenge.protectionSpace
+        let methods = [NSURLAuthenticationMethodHTTPBasic, NSURLAuthenticationMethodHTTPDigest, NSURLAuthenticationMethodNTLM]
+        // Certificates and everything else get WebKit's standard handling.
+        guard methods.contains(space.authenticationMethod) else { return (.performDefaultHandling, nil) }
+        guard challenge.previousFailureCount < 3, store?.isShowing(id) == true,
+              let credential = await askForCredential(for: space, afterFailure: challenge.previousFailureCount > 0)
+        else {
+            // Carry on without logging in, which shows the site's own "unauthorized" page.
+            return (.rejectProtectionSpace, nil)
+        }
+        return (.useCredential, credential)
+    }
+
+    private func askForCredential(for space: URLProtectionSpace, afterFailure: Bool) async -> URLCredential? {
+        var lines: [String] = []
+        if afterFailure { lines.append("That name and password were not accepted.") }
+        if let realm = space.realm, !realm.isEmpty { lines.append("The site says: “\(realm)”") }
+        if !space.receivesCredentialSecurely { lines.append("Your password will be sent unencrypted.") }
+        let alert = makeAlert(message: "Log in to \(space.host)", detail: lines.joined(separator: "\n"))
+
+        let user = NSTextField(frame: NSRect(x: 0, y: 30, width: 260, height: 24))
+        user.placeholderString = "Name"
+        let password = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        password.placeholderString = "Password"
+        let fields = NSView(frame: NSRect(x: 0, y: 0, width: 260, height: 54))
+        fields.addSubview(user)
+        fields.addSubview(password)
+        user.nextKeyView = password
+        alert.accessoryView = fields
+        alert.window.initialFirstResponder = user
+        alert.addButton(withTitle: "Log In")
+        alert.addButton(withTitle: "Cancel")
+
+        guard await present(alert) == .alertFirstButtonReturn else { return nil }
+        return URLCredential(user: user.stringValue, password: password.stringValue, persistence: .forSession)
+    }
+
+    /// Asks the page which icon it declares, preferring one large enough to look sharp. Vector
+    /// icons are skipped: they would have to be rendered outside WebKit's sandbox.
     private func requestFavicon(for pageURL: URL) {
         let script = """
         (() => {
-          const links = [...document.querySelectorAll('link[rel~="icon"], link[rel="apple-touch-icon"]')];
+          const links = [...document.querySelectorAll('link[rel~="icon"], link[rel="apple-touch-icon"]')]
+            .filter(l => l.type !== 'image/svg+xml' && !/\\.svg(\\?|#|$)/i.test(l.href));
           const size = l => {
             const m = /(\\d+)x\\d+/.exec(l.getAttribute('sizes') || '');
             return m ? +m[1] : (l.rel.includes('apple') ? 180 : 16);
@@ -277,11 +417,20 @@ extension TabSession: WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
-        download.delegate = self
+        adopt(download)
     }
 
     func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
-        download.delegate = self
+        adopt(download)
+    }
+
+    private func adopt(_ download: WKDownload) {
+        download.delegate = store?.downloads
+        if !hasCommittedNavigation {
+            // The tab was opened only to fetch this file and would otherwise sit there blank,
+            // downloading it again every time it was reopened.
+            store?.discardDownloadTab(id)
+        }
     }
 }
 
@@ -294,7 +443,7 @@ extension TabSession: WKUIDelegate {
         for navigationAction: WKNavigationAction,
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
-        store?.openPopupTab(configuration: configuration, url: navigationAction.request.url).webView
+        store?.openPopupTab(configuration: configuration, url: navigationAction.request.url, openedBy: id)?.webView
     }
 
     func webViewDidClose(_ webView: WKWebView) {
@@ -306,7 +455,7 @@ extension TabSession: WKUIDelegate {
         runJavaScriptAlertPanelWithMessage message: String,
         initiatedByFrame frame: WKFrameInfo
     ) async {
-        _ = await present(makeAlert(message: "\(pageName(frame)) says", detail: message))
+        _ = await presentPageDialog(makeAlert(message: "\(pageName(frame)) says", detail: message))
     }
 
     func webView(
@@ -317,7 +466,7 @@ extension TabSession: WKUIDelegate {
         let alert = makeAlert(message: "\(pageName(frame)) asks", detail: message)
         alert.addButton(withTitle: "OK")
         alert.addButton(withTitle: "Cancel")
-        return await present(alert) == .alertFirstButtonReturn
+        return await presentPageDialog(alert) == .alertFirstButtonReturn
     }
 
     func webView(
@@ -333,7 +482,7 @@ extension TabSession: WKUIDelegate {
         alert.window.initialFirstResponder = field
         alert.addButton(withTitle: "OK")
         alert.addButton(withTitle: "Cancel")
-        return await present(alert) == .alertFirstButtonReturn ? field.stringValue : nil
+        return await presentPageDialog(alert) == .alertFirstButtonReturn ? field.stringValue : nil
     }
 
     func webView(
@@ -357,53 +506,5 @@ extension TabSession: WKUIDelegate {
     ) async -> WKPermissionDecision {
         // Let WebKit ask the user, and remember the answer per site.
         .prompt
-    }
-}
-
-// MARK: - WKDownloadDelegate
-
-extension TabSession: WKDownloadDelegate {
-    func download(
-        _ download: WKDownload,
-        decideDestinationUsing response: URLResponse,
-        suggestedFilename: String
-    ) async -> URL? {
-        let directory = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory
-        let destination = TabSession.uniqueDestination(in: directory, filename: suggestedFilename)
-        downloadDestinations[ObjectIdentifier(download)] = destination
-        store?.showToast("Downloading \(destination.lastPathComponent)", symbol: "arrow.down.circle.fill")
-        return destination
-    }
-
-    func downloadDidFinish(_ download: WKDownload) {
-        guard let destination = downloadDestinations.removeValue(forKey: ObjectIdentifier(download)) else { return }
-        store?.showToast("Downloaded \(destination.lastPathComponent)", symbol: "arrow.down.circle.fill")
-        // Makes the Downloads stack in the Dock bounce, as it does for other browsers.
-        DistributedNotificationCenter.default().post(
-            name: Notification.Name("com.apple.DownloadFileFinished"),
-            object: destination.path
-        )
-    }
-
-    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
-        downloadDestinations.removeValue(forKey: ObjectIdentifier(download))
-        store?.showToast("Download failed", symbol: "exclamationmark.triangle.fill")
-    }
-
-    /// Never overwrites: "report.pdf" becomes "report 2.pdf" if the name is taken.
-    static func uniqueDestination(in directory: URL, filename: String) -> URL {
-        let safeName = (filename as NSString).lastPathComponent
-        let name = safeName.isEmpty || safeName == "." || safeName == ".." ? "download" : safeName
-        let base = (name as NSString).deletingPathExtension
-        let pathExtension = (name as NSString).pathExtension
-        var candidate = directory.appendingPathComponent(name)
-        var counter = 2
-        while FileManager.default.fileExists(atPath: candidate.path) {
-            let numbered = pathExtension.isEmpty ? "\(base) \(counter)" : "\(base) \(counter).\(pathExtension)"
-            candidate = directory.appendingPathComponent(numbered)
-            counter += 1
-        }
-        return candidate
     }
 }

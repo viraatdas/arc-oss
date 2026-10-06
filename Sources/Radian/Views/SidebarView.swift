@@ -196,6 +196,7 @@ private struct SpaceHeader: View {
             .menuIndicator(.hidden)
             .fixedSize()
             .opacity(isHovering ? 1 : 0)
+            .accessibilityLabel("\(space.name) options")
         }
         .foregroundStyle(.secondary)
         .padding(.leading, 9)
@@ -211,7 +212,7 @@ private struct SpaceHeader: View {
         Button("New Folder") { store.newFolder() }
         Divider()
         Button("New Space") { store.newSpace() }
-        Button("Delete Space", role: .destructive) { store.deleteSpace(space.id) }
+        Button("Delete Space…", role: .destructive) { store.requestDeleteSpace(space.id) }
             .disabled(store.state.spaces.count < 2)
     }
 }
@@ -247,42 +248,76 @@ private struct NewTabRow: View {
     }
 }
 
-/// The row of space icons along the bottom of the sidebar.
+/// The row of space icons along the bottom of the sidebar. With more spaces than fit, the icons
+/// scroll sideways and the buttons at either end stay put.
 private struct SpaceSwitcher: View {
     @Environment(BrowserStore.self) private var store
 
     var body: some View {
-        let current = store.state.currentSpaceID
-
         HStack(spacing: 2) {
             ChromeButton(symbol: "archivebox", help: "Archive (⇧⌘A)") {
                 store.isArchivePresented = true
             }
-            Spacer(minLength: 4)
-            ForEach(store.state.spaces) { space in
-                Button {
-                    store.switchSpace(to: space.id)
-                } label: {
-                    SpaceIconView(icon: space.icon, size: 13)
-                        .frame(width: 26, height: 26)
-                        .background(Circle().fill(.primary.opacity(space.id == current ? 0.12 : 0)))
-                        .opacity(space.id == current ? 1 : 0.45)
-                        .contentShape(Rectangle())
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal) {
+                    HStack(spacing: 2) {
+                        ForEach(store.state.spaces) { space in
+                            SpaceSwitcherIcon(space: space).id(space.id)
+                        }
+                    }
+                    .padding(.horizontal, 4)
+                    .frame(minWidth: 0)
                 }
-                .buttonStyle(.plain)
-                .help(space.name)
-                .contextMenu {
-                    Button("Edit Space…") { store.editingSpaceID = space.id }
-                    Button("Delete Space", role: .destructive) { store.deleteSpace(space.id) }
-                        .disabled(store.state.spaces.count < 2)
+                .scrollIndicators(.never)
+                .defaultScrollAnchor(.center)
+                .onChange(of: store.state.currentSpaceID) { _, id in
+                    withAnimation(.snappy) { proxy.scrollTo(id, anchor: .center) }
                 }
             }
-            Spacer(minLength: 4)
+            .frame(maxWidth: .infinity)
             ChromeButton(symbol: "plus", help: "New Space") {
                 store.newSpace()
             }
         }
         .padding(.horizontal, 8)
         .frame(height: 42)
+    }
+}
+
+private struct SpaceSwitcherIcon: View {
+    @Environment(BrowserStore.self) private var store
+    let space: Space
+
+    @State private var isDropTarget = false
+
+    var body: some View {
+        let isCurrent = space.id == store.state.currentSpaceID
+
+        Button {
+            store.switchSpace(to: space.id)
+        } label: {
+            SpaceIconView(icon: space.icon, size: 13)
+                .frame(width: 26, height: 26)
+                .background(Circle().fill(.primary.opacity(isCurrent || isDropTarget ? 0.12 : 0)))
+                .overlay(Circle().strokeBorder(Color.accentColor.opacity(isDropTarget ? 0.9 : 0), lineWidth: 2))
+                .opacity(isCurrent || isDropTarget ? 1 : 0.45)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(space.name)
+        .accessibilityLabel(space.name)
+        .accessibilityAddTraits(isCurrent ? .isSelected : [])
+        // Dropping a tab on a space's icon moves it into that space.
+        .onDrop(
+            of: [.radianSidebarItem],
+            delegate: SidebarDropDelegate(isTargeted: $isDropTarget) { id in
+                store.moveToSpace(id, spaceID: space.id)
+            }
+        )
+        .contextMenu {
+            Button("Edit Space…") { store.editingSpaceID = space.id }
+            Button("Delete Space…", role: .destructive) { store.requestDeleteSpace(space.id) }
+                .disabled(store.state.spaces.count < 2)
+        }
     }
 }

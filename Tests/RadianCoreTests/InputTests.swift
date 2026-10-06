@@ -25,6 +25,15 @@ import Testing
         ("file:///tmp/page.html", "file:///tmp/page.html"),
         ("mailto:someone@example.com", "mailto:someone@example.com"),
         ("slack://open?team=T1", "slack://open?team=T1"),
+        ("bun.sh", "https://bun.sh"),
+        ("notion.so/workspace", "https://notion.so/workspace"),
+        ("example.dev", "https://example.dev"),
+        ("myserver:8080", "http://myserver:8080"),
+        ("devbox:3000/health", "http://devbox:3000/health"),
+        ("nas.local", "http://nas.local"),
+        ("printer.local:631/admin", "http://printer.local:631/admin"),
+        ("router.lan", "http://router.lan"),
+        ("file:///Users/me/My Site/index.html", "file:///Users/me/My%20Site/index.html"),
     ])
     func treatsAddressesAsAddresses(input: String, expected: String) {
         #expect(resolve(input) == .url(URL(string: expected)!))
@@ -42,6 +51,17 @@ import Testing
         "hello:world",
         "error:unexpected",
         "user@example.com",
+        "Object.keys",
+        "JSON.parse",
+        "os.path",
+        "np.array",
+        "main.go",
+        "notes.docx",
+        "App.vue",
+        "readme.md",
+        "main.py",
+        "devbox",
+        "-bad.com",
     ])
     func treatsEverythingElseAsSearch(input: String) {
         #expect(resolve(input)?.isSearch == true)
@@ -156,6 +176,21 @@ import Testing
         #expect(history.search("swift", now: now).map(\.url) == [frequent, rare])
         #expect(history.search("nothing-matches", now: now).isEmpty)
         #expect(history.search("", now: now).isEmpty)
+    }
+
+    @Test func completesToTheSiteVisitedMostAcrossAllItsPages() {
+        var history = BrowsingHistory()
+        for index in 0..<200 {
+            history.record(url: URL(string: "https://github.com/org/repo/pull/\(index)")!, title: "PR", at: now)
+        }
+        for _ in 0..<3 { history.record(url: URL(string: "https://gitlab.com/")!, title: "GitLab", at: now) }
+        let site = history.bestHostMatch(forPrefix: "gi")
+        #expect(site?.url.absoluteString == "https://github.com/")
+        #expect(site?.visitCount == 200)
+
+        // When the front page itself was visited, it is offered with its own title.
+        history.record(url: URL(string: "https://github.com/")!, title: "GitHub", at: now)
+        #expect(history.bestHostMatch(forPrefix: "gith")?.title == "GitHub")
     }
 
     @Test func completesHostsFromTheirFirstLetters() {

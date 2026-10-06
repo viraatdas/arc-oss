@@ -61,6 +61,20 @@
 			</array>
 		</dict>
 	</array>
+	<!-- Sidebar rows being dragged within Radian. -->
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>io.github.viraatdas.radian.sidebar-item</string>
+			<key>UTTypeDescription</key>
+			<string>Radian sidebar item</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+		</dict>
+	</array>
 	<!-- A browser has to be able to load plain-http pages. This applies to web content only. -->
 	<key>NSAppTransportSecurity</key>
 	<dict>

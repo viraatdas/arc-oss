@@ -4,6 +4,27 @@ import UniformTypeIdentifiers
 
 private let rowShape = RoundedRectangle(cornerRadius: 8, style: .continuous)
 
+extension UTType {
+    /// A sidebar item being dragged inside Radian. Declared in Info.plist.
+    static let radianSidebarItem = UTType(exportedAs: "io.github.viraatdas.radian.sidebar-item")
+}
+
+/// What a sidebar row puts on the drag pasteboard: its id, which only Radian can read, and for a
+/// tab its address, so dropping it on another app or on a page gives that app the link.
+func dragProvider(for item: SidebarItem) -> NSItemProvider {
+    let provider = NSItemProvider()
+    let id = Data(item.id.uuidString.utf8)
+    provider.registerDataRepresentation(forTypeIdentifier: UTType.radianSidebarItem.identifier, visibility: .ownProcess) { completion in
+        completion(id, nil)
+        return nil
+    }
+    if !item.isFolder, let url = item.url ?? item.homeURL {
+        provider.registerObject(url as NSURL, visibility: .all)
+    }
+    provider.suggestedName = item.displayTitle
+    return provider
+}
+
 /// One entry in the pinned or unpinned list. Folders draw their children beneath themselves.
 struct SidebarNode: View {
     let item: SidebarItem
@@ -38,11 +59,12 @@ private struct TabRow: View {
 
     var body: some View {
         let isSelected = store.isOnScreen(item.id)
+        let isRenaming = store.renamingItemID == item.id
 
         HStack(spacing: 9) {
             // A pinned tab keeps the icon of the site it is pinned to, wherever it has wandered.
             FaviconView(url: item.homeURL ?? item.url)
-            if store.renamingItemID == item.id {
+            if isRenaming {
                 RenameField(item: item)
             } else {
                 Text(item.displayTitle)
@@ -51,7 +73,7 @@ private struct TabRow: View {
                     .truncationMode(.tail)
             }
             Spacer(minLength: 0)
-            if isHovering, store.renamingItemID != item.id {
+            if isHovering, !isRenaming {
                 Button {
                     store.closeTab(item.id)
                 } label: {
@@ -63,7 +85,7 @@ private struct TabRow: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
-                .help(section == .tabs ? "Close Tab" : "Unload Tab")
+                .help(closeLabel)
             }
         }
         .padding(.leading, 9)
@@ -76,12 +98,9 @@ private struct TabRow: View {
         .onHover { isHovering = $0 }
         .padding(.leading, CGFloat(depth) * 16)
         .overlay(alignment: .top) { InsertionLine(isVisible: isDropTarget) }
-        .onDrag {
-            store.draggingItemID = item.id
-            return NSItemProvider(object: item.id.uuidString as NSString)
-        }
+        .onDrag { dragProvider(for: item) }
         .onDrop(
-            of: [.text],
+            of: [.radianSidebarItem],
             delegate: SidebarDropDelegate(
                 store: store,
                 destination: MoveDestination(spaceID: spaceID, section: section, placement: .before(item.id)),
@@ -89,7 +108,16 @@ private struct TabRow: View {
             )
         )
         .contextMenu { TabContextMenu(item: item, section: section, spaceID: spaceID) }
+        // While renaming, the text field has to stay reachable; otherwise the row is one button.
+        .accessibilityElement(children: isRenaming ? .contain : .ignore)
+        .accessibilityLabel(item.displayTitle)
+        .accessibilityValue(item.url.map(BrowsingHistory.bareHost) ?? "")
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
+        .accessibilityAction { store.select(item.id) }
+        .accessibilityAction(named: closeLabel) { store.closeTab(item.id) }
     }
+
+    private var closeLabel: String { section == .tabs ? "Close Tab" : "Unload Tab" }
 
     private func fill(isSelected: Bool) -> Color {
         if isSelected { return scheme == .dark ? .white.opacity(0.18) : .white.opacity(0.9) }
@@ -107,12 +135,15 @@ private struct FolderRow: View {
     @State private var isDropTarget = false
 
     var body: some View {
+        let isRenaming = store.renamingItemID == item.id
+        let count = item.children.allTabs.count
+
         HStack(spacing: 9) {
             Image(systemName: item.isExpanded ? "folder.fill" : "folder")
                 .font(.system(size: 12.5))
                 .foregroundStyle(.secondary)
                 .frame(width: 16, height: 16)
-            if store.renamingItemID == item.id {
+            if isRenaming {
                 RenameField(item: item)
             } else {
                 Text(item.displayTitle)
@@ -120,8 +151,8 @@ private struct FolderRow: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 0)
-            if !item.isExpanded, !item.children.isEmpty {
-                Text("\(item.children.allTabs.count)")
+            if !item.isExpanded, count > 0 {
+                Text("\(count)")
                     .font(.system(size: 11))
                     .foregroundStyle(.tertiary)
                     .padding(.trailing, 4)
@@ -135,12 +166,9 @@ private struct FolderRow: View {
         .onTapGesture { store.toggleFolder(item.id) }
         .onHover { isHovering = $0 }
         .padding(.leading, CGFloat(depth) * 16)
-        .onDrag {
-            store.draggingItemID = item.id
-            return NSItemProvider(object: item.id.uuidString as NSString)
-        }
+        .onDrag { dragProvider(for: item) }
         .onDrop(
-            of: [.text],
+            of: [.radianSidebarItem],
             delegate: SidebarDropDelegate(
                 store: store,
                 destination: MoveDestination(spaceID: spaceID, section: .pinned, placement: .inFolder(item.id)),
@@ -151,14 +179,22 @@ private struct FolderRow: View {
             Button("Rename…") { store.renamingItemID = item.id }
             Button(item.isExpanded ? "Collapse" : "Expand") { store.toggleFolder(item.id) }
             Divider()
-            Button("Delete Folder", role: .destructive) { store.removeItem(item.id) }
+            Button("Delete Folder…", role: .destructive) { store.requestDeleteFolder(item.id) }
         }
+        .accessibilityElement(children: isRenaming ? .contain : .ignore)
+        .accessibilityLabel("\(item.displayTitle), folder")
+        .accessibilityValue("\(item.isExpanded ? "Expanded" : "Collapsed"), \(count) \(count == 1 ? "tab" : "tabs")")
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction { store.toggleFolder(item.id) }
     }
 }
 
 struct FavoritesGrid: View {
+    @Environment(BrowserStore.self) private var store
     let items: [SidebarItem]
     let spaceID: UUID
+
+    @State private var isDropTarget = false
 
     private let columns = [GridItem(.adaptive(minimum: 50, maximum: 140), spacing: 6)]
 
@@ -168,6 +204,16 @@ struct FavoritesGrid: View {
                 FavoriteTile(item: item, spaceID: spaceID)
             }
         }
+        // Gaps between tiles and the space after the last one add to the end of the grid.
+        .contentShape(Rectangle())
+        .onDrop(
+            of: [.radianSidebarItem],
+            delegate: SidebarDropDelegate(
+                store: store,
+                destination: MoveDestination(spaceID: spaceID, section: .favorites, placement: .end),
+                isTargeted: $isDropTarget
+            )
+        )
     }
 }
 
@@ -194,12 +240,9 @@ private struct FavoriteTile: View {
             .onTapGesture { store.select(item.id) }
             .onHover { isHovering = $0 }
             .help(item.displayTitle)
-            .onDrag {
-                store.draggingItemID = item.id
-                return NSItemProvider(object: item.id.uuidString as NSString)
-            }
+            .onDrag { dragProvider(for: item) }
             .onDrop(
-                of: [.text],
+                of: [.radianSidebarItem],
                 delegate: SidebarDropDelegate(
                     store: store,
                     destination: MoveDestination(spaceID: spaceID, section: .favorites, placement: .before(item.id)),
@@ -207,6 +250,11 @@ private struct FavoriteTile: View {
                 )
             )
             .contextMenu { TabContextMenu(item: item, section: .favorites, spaceID: spaceID) }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(item.displayTitle)
+            .accessibilityValue("Favorite")
+            .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
+            .accessibilityAction { store.select(item.id) }
     }
 
     private func fill(isSelected: Bool) -> Color {
@@ -243,16 +291,7 @@ private struct TabContextMenu: View {
         if store.state.spaces.count > 1 {
             Menu("Move to Space") {
                 ForEach(store.state.spaces.filter { $0.id != spaceID }) { space in
-                    Button(space.name) {
-                        store.move(
-                            item.id,
-                            to: MoveDestination(
-                                spaceID: space.id,
-                                section: section == .tabs ? .tabs : .pinned,
-                                placement: .end
-                            )
-                        )
-                    }
+                    Button(space.name) { store.moveToSpace(item.id, spaceID: space.id) }
                 }
             }
         }
@@ -260,8 +299,9 @@ private struct TabContextMenu: View {
         if section == .tabs {
             Button("Close Tab") { store.closeTab(item.id) }
         } else {
+            // Recoverable from the archive, so it does not ask first.
             Button(section == .favorites ? "Remove from Favorites" : "Remove Pinned Tab", role: .destructive) {
-                store.removeItem(item.id)
+                store.deleteItem(item.id)
             }
         }
     }
@@ -332,21 +372,31 @@ struct DropZone: View {
         .overlay(alignment: .top) { InsertionLine(isVisible: isDropTarget && hint == nil).offset(y: 2) }
         .contentShape(Rectangle())
         .onDrop(
-            of: [.text],
+            of: [.radianSidebarItem],
             delegate: SidebarDropDelegate(store: store, destination: destination, isTargeted: $isDropTarget)
         )
+        .accessibilityHidden(hint == nil)
     }
 }
 
-/// Drops move the item being dragged. The id travels through the store rather than the pasteboard,
-/// because drags only ever start inside this window.
+/// Handles a drop of a sidebar item. The id is read from the drop itself, so only drags that
+/// started on a sidebar row are accepted, and each drop acts on exactly what was dragged.
 struct SidebarDropDelegate: DropDelegate {
-    let store: BrowserStore
-    let destination: MoveDestination
     @Binding var isTargeted: Bool
+    let perform: @MainActor (UUID) -> Void
+
+    /// Moves the dropped item to `destination`.
+    init(store: BrowserStore, destination: MoveDestination, isTargeted: Binding<Bool>) {
+        self.init(isTargeted: isTargeted) { id in store.move(id, to: destination) }
+    }
+
+    init(isTargeted: Binding<Bool>, perform: @escaping @MainActor (UUID) -> Void) {
+        _isTargeted = isTargeted
+        self.perform = perform
+    }
 
     func validateDrop(info: DropInfo) -> Bool {
-        store.draggingItemID != nil
+        info.hasItemsConforming(to: [.radianSidebarItem])
     }
 
     func dropEntered(info: DropInfo) {
@@ -363,9 +413,14 @@ struct SidebarDropDelegate: DropDelegate {
 
     func performDrop(info: DropInfo) -> Bool {
         isTargeted = false
-        guard let id = store.draggingItemID else { return false }
-        store.draggingItemID = nil
-        store.move(id, to: destination)
+        guard let provider = info.itemProviders(for: [.radianSidebarItem]).first else { return false }
+        let perform = self.perform
+        provider.loadDataRepresentation(forTypeIdentifier: UTType.radianSidebarItem.identifier) { data, _ in
+            guard let data, let text = String(data: data, encoding: .utf8), let id = UUID(uuidString: text) else {
+                return
+            }
+            Task { @MainActor in perform(id) }
+        }
         return true
     }
 }

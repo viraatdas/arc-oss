@@ -44,6 +44,16 @@ struct RootView: View {
         .animation(.easeOut(duration: 0.12), value: store.commandBar?.id)
         .animation(.snappy(duration: 0.25), value: store.toast)
         .animation(.easeInOut(duration: 0.3), value: space.theme)
+        .confirmationDialog(
+            store.pendingDeletion.map { store.describe($0).title } ?? "",
+            isPresented: deletionBinding,
+            presenting: store.pendingDeletion
+        ) { deletion in
+            Button(store.describe(deletion).action, role: .destructive) { store.confirm(deletion) }
+            Button("Cancel", role: .cancel) { store.pendingDeletion = nil }
+        } message: { deletion in
+            Text(store.describe(deletion).message)
+        }
         .sheet(isPresented: archiveBinding) {
             ArchiveView()
         }
@@ -52,6 +62,10 @@ struct RootView: View {
                 SpaceEditor(spaceID: id)
             }
         }
+    }
+
+    private var deletionBinding: Binding<Bool> {
+        Binding(get: { store.pendingDeletion != nil }, set: { if !$0 { store.pendingDeletion = nil } })
     }
 
     private var archiveBinding: Binding<Bool> {
@@ -68,16 +82,20 @@ struct SidebarResizeHandle: View {
     @Environment(BrowserStore.self) private var store
     let width: CGFloat
     @State private var widthAtDragStart: CGFloat?
+    @State private var hasPushedCursor = false
 
     var body: some View {
         Color.clear
             .frame(width: width)
             .contentShape(Rectangle())
             .onHover { inside in
-                if inside {
+                // Push and pop strictly in pairs, or the cursor stack drifts.
+                if inside, !hasPushedCursor {
                     NSCursor.resizeLeftRight.push()
-                } else {
+                    hasPushedCursor = true
+                } else if !inside, hasPushedCursor {
                     NSCursor.pop()
+                    hasPushedCursor = false
                 }
             }
             .gesture(
@@ -87,7 +105,11 @@ struct SidebarResizeHandle: View {
                         widthAtDragStart = start
                         store.setSidebarWidth(start + value.translation.width)
                     }
-                    .onEnded { _ in widthAtDragStart = nil }
+                    .onEnded { _ in
+                        widthAtDragStart = nil
+                        store.commitSidebarWidth()
+                    }
             )
+            .accessibilityHidden(true)
     }
 }

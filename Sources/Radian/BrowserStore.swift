@@ -8,7 +8,7 @@ struct CommandBarRequest: Identifiable, Equatable {
     enum Mode {
         /// Whatever is chosen opens in a new tab.
         case newTab
-        /// Whatever is chosen replaces the page in the selected tab.
+        /// Whatever is chosen replaces the page in `targetTabID`.
         case currentTab
         /// Whatever is chosen opens beside the selected tab.
         case splitPane
@@ -17,12 +17,42 @@ struct CommandBarRequest: Identifiable, Equatable {
     let id = UUID()
     var mode: Mode
     var initialText: String
+    /// The tab a `.currentTab` request navigates: whichever pane had focus when the bar opened.
+    var targetTabID: UUID?
 }
 
 struct Toast: Identifiable, Equatable {
     let id = UUID()
     var text: String
     var symbol: String
+}
+
+/// Something irreversible waiting for the user to confirm it.
+enum PendingDeletion: Identifiable, Equatable {
+    case space(UUID)
+    case folder(UUID)
+
+    var id: UUID {
+        switch self {
+        case .space(let id), .folder(let id): id
+        }
+    }
+}
+
+/// A problem with the saved state that the user needs to hear about at launch.
+enum StateNotice {
+    /// The state file could not be read. It was kept at this address and Radian started fresh.
+    case unreadable(URL)
+    /// The state file came from a newer version of Radian. A copy was kept before using it.
+    case newerVersion(backup: URL?)
+}
+
+/// What ⇧⌘T can bring back.
+private enum ClosedTab {
+    /// An unpinned tab, now this archive entry.
+    case archived(UUID)
+    /// A pinned tab or favorite that was unloaded and is still in the sidebar.
+    case unloaded(UUID)
 }
 
 /// The single source of truth for the window: persisted state, live web views and transient UI state.
@@ -38,10 +68,14 @@ final class BrowserStore {
     var isSidebarVisible = true
     var commandBar: CommandBarRequest?
     var renamingItemID: UUID?
-    var draggingItemID: UUID?
     var findBarTabID: UUID?
+    /// Bumped to ask an open find bar to take focus again.
+    private(set) var findFocusRequest = 0
     var editingSpaceID: UUID?
     var isArchivePresented = false
+    var pendingDeletion: PendingDeletion?
+    /// The sidebar's width while it is being dragged. Saved only when the drag ends.
+    private(set) var liveSidebarWidth: CGFloat?
     private(set) var toast: Toast?
     /// The edge the incoming space slides in from.
     private(set) var spaceTransitionEdge: Edge = .trailing
@@ -50,9 +84,14 @@ final class BrowserStore {
     private(set) var pageStills: [UUID: NSImage] = [:]
 
     let favicons: FaviconStore
-    /// True when no saved state existed at launch.
+    let downloads = DownloadCenter()
+    /// True when there was no saved state at launch, as opposed to state that could not be read.
     let isFirstLaunch: Bool
+    /// Set when the saved state needed attention at launch; the app delegate tells the user.
+    let stateNotice: StateNotice?
 
+    /// Sites allowed to download files during this session.
+    @ObservationIgnored var downloadHosts: Set<String> = []
     @ObservationIgnored weak var window: NSWindow?
     @ObservationIgnored private let stateFile: JSONFileStore<BrowserState>
     @ObservationIgnored private let historyFile: JSONFileStore<BrowsingHistory>
@@ -60,18 +99,37 @@ final class BrowserStore {
     @ObservationIgnored private var isHistoryDirty = false
     @ObservationIgnored private var dataStores: [UUID: WKWebsiteDataStore] = [:]
     @ObservationIgnored private var archiveTimer: Timer?
+    @ObservationIgnored private var closedTabs: [ClosedTab] = []
 
     init(directory: URL = AppPaths.dataDirectory()) {
         stateFile = JSONFileStore(url: directory.appendingPathComponent("state.json"))
         historyFile = JSONFileStore(url: directory.appendingPathComponent("history.json"))
         favicons = FaviconStore(directory: directory.appendingPathComponent("favicons", isDirectory: true))
 
-        let loaded = stateFile.loadOrQuarantine()
-        isFirstLaunch = loaded == nil
-        var state = loaded ?? .fresh()
+        var state: BrowserState
+        var notice: StateNotice?
+        switch stateFile.loadOrSetAside() {
+        case .loaded(let loaded):
+            state = loaded
+            if loaded.schemaVersion > BrowserState.currentSchemaVersion {
+                // Whatever this version does not understand would be lost on the next save.
+                notice = .newerVersion(backup: stateFile.backUp(suffix: "from-newer-version"))
+                state.schemaVersion = BrowserState.currentSchemaVersion
+            }
+            isFirstLaunch = false
+        case .missing:
+            state = .fresh()
+            isFirstLaunch = true
+        case .setAside(let location):
+            state = .fresh()
+            notice = .unreadable(location)
+            isFirstLaunch = false
+        }
         state.repair()
         self.state = state
-        history = historyFile.loadOrQuarantine() ?? BrowsingHistory()
+        stateNotice = notice
+        history = historyFile.loadOrSetAside().value ?? BrowsingHistory()
+        downloads.report = { [weak self] text, symbol in self?.showToast(text, symbol: symbol) }
     }
 
     /// Called once the window exists: wakes the tabs that are on screen and starts housekeeping.
@@ -91,10 +149,32 @@ final class BrowserStore {
     var selectedSession: TabSession? { selectedTabID.flatMap { sessions[$0] } }
     var splitSession: TabSession? { currentSpace.splitTabID.flatMap { sessions[$0] } }
     var isSplit: Bool { currentSpace.splitTabID != nil }
-    var sidebarWidth: CGFloat { CGFloat(state.settings.sidebarWidth) }
+    var sidebarWidth: CGFloat { liveSidebarWidth ?? CGFloat(state.settings.sidebarWidth) }
 
+    /// The tab page commands act on: the split pane holding keyboard focus, else the selected tab.
+    var focusedTabID: UUID? {
+        if let split = currentSpace.splitTabID, let webView = sessions[split]?.webView,
+           let responder = window?.firstResponder as? NSView, responder.isDescendant(of: webView) {
+            return split
+        }
+        return selectedTabID
+    }
+
+    var focusedSession: TabSession? { focusedTabID.flatMap { sessions[$0] } }
+
+    /// Whether the tab is in one of the current space's panes.
     func isOnScreen(_ id: UUID) -> Bool {
         currentSpace.selectedTabID == id || currentSpace.splitTabID == id
+    }
+
+    /// Whether the user can actually see the tab right now: on screen, in a window that is open.
+    func isShowing(_ id: UUID) -> Bool {
+        isOnScreen(id) && window?.isVisible == true
+    }
+
+    /// The session showing a page dialog in this sheet window, if any.
+    func session(presentingDialogIn sheet: NSWindow) -> TabSession? {
+        sessions.values.first { $0.dialogWindow === sheet }
     }
 
     // MARK: - Persistence
@@ -107,10 +187,12 @@ final class BrowserStore {
         return result
     }
 
+    /// Saves shortly after the first unsaved change. Later changes ride along with that save
+    /// rather than pushing it back, so a page that never stops changing cannot postpone saving.
     private func scheduleSave() {
-        saveTask?.cancel()
+        guard saveTask == nil else { return }
         saveTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(400))
+            try? await Task.sleep(for: .milliseconds(500))
             guard !Task.isCancelled else { return }
             self?.saveNow()
         }
@@ -118,6 +200,7 @@ final class BrowserStore {
 
     func saveNow() {
         saveTask?.cancel()
+        saveTask = nil
         do {
             try stateFile.save(state)
             if isHistoryDirty {
@@ -148,6 +231,8 @@ final class BrowserStore {
         configuration.websiteDataStore = dataStore(forProfile: profileID)
         configuration.applicationNameForUserAgent = BrowserStore.userAgentSuffix
         configuration.preferences.isElementFullscreenEnabled = true
+        // Pages may open windows only in response to a click, never on a timer or on load.
+        configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
         // Enables "Inspect Element" in the page's context menu.
         configuration.preferences.setValue(true, forKey: "developerExtrasEnabled")
         return configuration
@@ -179,6 +264,7 @@ final class BrowserStore {
         sessions[id]?.teardown()
         sessions[id] = nil
         if findBarTabID == id { findBarTabID = nil }
+        pageStills[id] = nil
     }
 
     private func wakeVisibleTabs() {
@@ -186,34 +272,36 @@ final class BrowserStore {
         if let id = currentSpace.splitTabID { ensureSession(for: id) }
     }
 
-    func focusWebContent() {
+    func focusWebContent(_ id: UUID? = nil) {
         DispatchQueue.main.async { [weak self] in
             guard let self, self.commandBar == nil, self.renamingItemID == nil,
-                  let webView = self.selectedSession?.webView, webView.window != nil
+                  let webView = (id.flatMap { self.sessions[$0] } ?? self.selectedSession)?.webView,
+                  webView.window != nil
             else { return }
             self.window?.makeFirstResponder(webView)
+        }
+    }
+
+    /// The window was closed (it stays alive, hidden). Nothing should keep playing behind it.
+    func windowDidHide() {
+        for session in sessions.values {
+            session.webView.setAllMediaPlaybackSuspended(true)
+        }
+    }
+
+    func windowDidShow() {
+        for session in sessions.values {
+            session.webView.setAllMediaPlaybackSuspended(false)
         }
     }
 
     // MARK: - Tabs
 
     func select(_ id: UUID) {
-        guard let item = state.item(withID: id), !item.isFolder, let address = state.address(of: id) else { return }
-        // Favorites belong to a profile, not a space, so they open in whichever space is showing.
-        let spaceID = address.spaceID ?? state.currentSpaceID
-        mutate { state in
-            guard let index = state.spaces.firstIndex(where: { $0.id == spaceID }) else { return }
-            if state.spaces[index].splitTabID == id {
-                // The tab is already in the other pane: swap the panes instead of showing it twice.
-                state.spaces[index].splitTabID = state.spaces[index].selectedTabID
-            }
-            state.spaces[index].selectedTabID = id
-            state.currentSpaceID = spaceID
-            state.updateItem(withID: id) { $0.lastActiveAt = Date() }
-        }
+        guard mutate({ $0.select(id) }) else { return }
         ensureSession(for: id)
         if findBarTabID != id { findBarTabID = nil }
-        focusWebContent()
+        focusWebContent(id)
     }
 
     @discardableResult
@@ -231,29 +319,35 @@ final class BrowserStore {
     }
 
     /// Adopts a web view that a page asked for with `window.open` or a `target=_blank` link.
-    /// WebKit requires the new view to be built from the configuration it hands over.
-    func openPopupTab(configuration: WKWebViewConfiguration, url: URL?) -> TabSession {
+    /// WebKit requires the new view to be built from the configuration it hands over, which ties
+    /// it to the opener's profile, so the tab opens in the opener's space. It comes to the front
+    /// only if the opener is on screen.
+    func openPopupTab(configuration: WKWebViewConfiguration, url: URL?, openedBy opener: UUID) -> TabSession? {
+        guard let address = state.address(of: opener) else { return nil }
+        let spaceID = address.spaceID ?? state.currentSpaceID
         let item = SidebarItem.tab(url: url ?? URL(string: "about:blank")!)
-        mutate { state in
-            state.insert(item, at: MoveDestination(spaceID: state.currentSpaceID, section: .tabs, placement: .start))
+        guard mutate({ $0.insert(item, at: MoveDestination(spaceID: spaceID, section: .tabs, placement: .start)) }) else {
+            return nil
         }
         let session = TabSession(id: item.id, configuration: configuration, store: self)
         sessions[item.id] = session
-        select(item.id)
+        if isShowing(opener) {
+            select(item.id)
+        }
         return session
     }
 
     /// Opens an address chosen in the command bar, or one handed over by another app.
-    func open(_ url: URL, mode: CommandBarRequest.Mode) {
+    func open(_ url: URL, mode: CommandBarRequest.Mode, target: UUID? = nil) {
         guard BrowserStore.isWebURL(url) else {
             NSWorkspace.shared.open(url)
             return
         }
         switch mode {
         case .currentTab:
-            if let id = selectedTabID, let session = ensureSession(for: id) {
+            if let id = target ?? focusedTabID, let session = ensureSession(for: id) {
                 session.load(url)
-                focusWebContent()
+                focusWebContent(id)
             } else {
                 openTab(url: url)
             }
@@ -269,41 +363,44 @@ final class BrowserStore {
     }
 
     func closeTab(_ id: UUID) {
-        guard let address = state.address(of: id) else { return }
         let wasSelected = currentSpace.selectedTabID == id
+        guard let outcome = mutate({ $0.close(id) }) else { return }
         discardSession(id)
-        mutate { state in
-            for index in state.spaces.indices {
-                if state.spaces[index].splitTabID == id {
-                    state.spaces[index].splitTabID = nil
-                }
-                if state.spaces[index].selectedTabID == id {
-                    state.spaces[index].selectedTabID = state.spaces[index].splitTabID
-                    state.spaces[index].splitTabID = nil
-                }
-            }
-            switch address.section {
-            case .tabs:
-                if let removed = state.removeItem(withID: id), let spaceID = address.spaceID {
-                    state.archive(removed, spaceID: spaceID)
-                }
-            case .pinned, .favorites:
-                // Pinned tabs are never removed by closing. They go back to sleep at their home.
-                state.updateItem(withID: id) { $0.url = $0.homeURL ?? $0.url }
-            }
+        switch outcome {
+        case .archived(let entryID): closedTabs.append(.archived(entryID))
+        case .unloaded: closedTabs.append(.unloaded(id))
+        case .removed: break
         }
-        if wasSelected, currentSpace.selectedTabID == nil, let next = tabToSelect(afterClosing: id) {
-            select(next)
-        } else {
-            wakeVisibleTabs()
-        }
+        if closedTabs.count > 50 { closedTabs.removeFirst(closedTabs.count - 50) }
+        selectNextTab(ifNoneAfterClosing: id, wasSelected: wasSelected)
     }
 
-    func closeSelectedTab() {
-        if let id = selectedTabID {
+    func closeFocusedTab() {
+        if let id = focusedTabID {
             closeTab(id)
         } else {
             window?.performClose(nil)
+        }
+    }
+
+    /// Removes a tab whose only purpose was a download, as other browsers do. Unlike closing, it
+    /// leaves nothing in the archive: there was never a page to come back to.
+    func discardDownloadTab(_ id: UUID) {
+        guard state.address(of: id)?.section == .tabs else { return }
+        let wasSelected = currentSpace.selectedTabID == id
+        discardSession(id)
+        mutate { state in
+            state.removeItem(withID: id)
+            state.repairSelections()
+        }
+        selectNextTab(ifNoneAfterClosing: id, wasSelected: wasSelected)
+    }
+
+    private func selectNextTab(ifNoneAfterClosing closed: UUID, wasSelected: Bool) {
+        if wasSelected, currentSpace.selectedTabID == nil, let next = tabToSelect(afterClosing: closed) {
+            select(next)
+        } else {
+            wakeVisibleTabs()
         }
     }
 
@@ -322,24 +419,34 @@ final class BrowserStore {
             .id
     }
 
+    /// Brings back the most recently closed tab, skipping any that have since gone for good.
     func reopenClosedTab() {
-        guard let entry = state.archive.first else { return }
-        restoreArchived(entry.id)
+        while let last = closedTabs.popLast() {
+            switch last {
+            case .archived(let entryID) where state.archive.contains(where: { $0.id == entryID }):
+                restoreArchived(entryID)
+                return
+            case .unloaded(let id) where state.item(withID: id) != nil:
+                select(id)
+                return
+            default:
+                continue
+            }
+        }
+        // Nothing closed in this session: offer the newest archive entry instead.
+        if let entry = state.archive.first {
+            restoreArchived(entry.id)
+        }
     }
 
-    func restoreArchived(_ id: UUID) {
-        guard let entry = state.archive.first(where: { $0.id == id }) else { return }
-        let spaceID = state.space(withID: entry.spaceID) != nil ? entry.spaceID : state.currentSpaceID
-        let item = SidebarItem.tab(url: entry.url, title: entry.title)
-        mutate { state in
-            state.archive.removeAll { $0.id == id }
-            state.insert(item, at: MoveDestination(spaceID: spaceID, section: .tabs, placement: .start))
-        }
-        select(item.id)
+    func restoreArchived(_ entryID: UUID) {
+        guard let id = mutate({ $0.restoreArchived(entryID) }) else { return }
+        select(id)
     }
 
     func clearArchive() {
         mutate { $0.archive.removeAll() }
+        closedTabs.removeAll { if case .archived = $0 { return true } else { return false } }
     }
 
     private func sweepArchive() {
@@ -378,14 +485,34 @@ final class BrowserStore {
 
     // MARK: - Sidebar structure
 
-    func move(_ id: UUID, to destination: MoveDestination) {
+    @discardableResult
+    func move(_ id: UUID, to destination: MoveDestination) -> Bool {
         let before = state.address(of: id)
-        guard mutate({ $0.move(id, to: destination) }) else { return }
+        guard mutate({ $0.move(id, to: destination) }) else { return false }
         if before?.profileID != state.address(of: id)?.profileID, let item = state.item(withID: id) {
             // A web view is bound to its profile's cookie jar, so it cannot follow the tab across.
             [item].allTabs.forEach { discardSession($0.id) }
         }
         wakeVisibleTabs()
+        return true
+    }
+
+    /// Where an item dropped on a space's icon goes: open tabs stay open tabs, everything else
+    /// is pinned. Nil when it is already in that space.
+    func destination(forDropping id: UUID, onSpace spaceID: UUID) -> MoveDestination? {
+        guard let address = state.address(of: id), address.spaceID != spaceID else { return nil }
+        if address.section == .tabs {
+            return MoveDestination(spaceID: spaceID, section: .tabs, placement: .start)
+        }
+        return MoveDestination(spaceID: spaceID, section: .pinned, placement: .end)
+    }
+
+    func moveToSpace(_ id: UUID, spaceID: UUID) {
+        guard let destination = destination(forDropping: id, onSpace: spaceID),
+              let name = state.space(withID: spaceID)?.name,
+              move(id, to: destination)
+        else { return }
+        showToast("Moved to \(name)", symbol: "arrow.right.circle.fill")
     }
 
     func togglePin(_ id: UUID) {
@@ -422,24 +549,64 @@ final class BrowserStore {
             state.updateItem(withID: id) { item in
                 if item.isFolder {
                     if !trimmed.isEmpty { item.title = trimmed }
+                } else if trimmed.isEmpty || trimmed == item.title {
+                    // An empty or unchanged name keeps following the page's own title.
+                    item.customTitle = nil
                 } else {
-                    // Clearing a tab's name goes back to showing the page title.
-                    item.customTitle = trimmed.isEmpty ? nil : trimmed
+                    item.customTitle = trimmed
                 }
             }
         }
         renamingItemID = nil
+        focusWebContent()
     }
 
-    /// Deletes a pinned tab, favorite or folder (with everything in it) outright.
-    func removeItem(_ id: UUID) {
+    /// Removes a pinned tab, favorite or folder. Its tabs go to the archive, so this can be undone
+    /// from there.
+    func deleteItem(_ id: UUID) {
         guard let item = state.item(withID: id) else { return }
         [item].allTabs.forEach { discardSession($0.id) }
-        mutate { state in
-            state.removeItem(withID: id)
-            state.repairSelections()
-        }
+        mutate { $0.deleteItem(withID: id) }
         wakeVisibleTabs()
+    }
+
+    /// Deletes an empty folder straight away, and asks first about one with tabs in it.
+    func requestDeleteFolder(_ id: UUID) {
+        guard let folder = state.item(withID: id), folder.isFolder else { return }
+        if folder.children.allTabs.isEmpty {
+            deleteItem(id)
+        } else {
+            pendingDeletion = .folder(id)
+        }
+    }
+
+    func requestDeleteSpace(_ id: UUID) {
+        guard state.spaces.count > 1, state.space(withID: id) != nil else { return }
+        pendingDeletion = .space(id)
+    }
+
+    /// The wording of the confirmation for a pending deletion.
+    func describe(_ deletion: PendingDeletion) -> (title: String, message: String, action: String) {
+        func tabs(_ count: Int) -> String { count == 1 ? "Its tab" : "Its \(count) tabs" }
+        switch deletion {
+        case .space(let id):
+            let space = state.space(withID: id)
+            let count = (space?.pinned.allTabs.count ?? 0) + (space?.tabs.count ?? 0)
+            let detail = count == 0 ? "It has no tabs." : "\(tabs(count)) will move to the archive."
+            return ("Delete the space “\(space?.name ?? "")”?", detail, "Delete Space")
+        case .folder(let id):
+            let folder = state.item(withID: id)
+            let count = folder?.children.allTabs.count ?? 0
+            return ("Delete the folder “\(folder?.displayTitle ?? "")”?", "\(tabs(count)) will move to the archive.", "Delete Folder")
+        }
+    }
+
+    func confirm(_ deletion: PendingDeletion) {
+        pendingDeletion = nil
+        switch deletion {
+        case .space(let id): deleteSpace(id)
+        case .folder(let id): deleteItem(id)
+        }
     }
 
     /// Returns a pinned tab to the address it was pinned at.
@@ -458,8 +625,15 @@ final class BrowserStore {
         }
     }
 
+    /// Follows a resize drag. Only the final width is saved, when `commitSidebarWidth` is called.
     func setSidebarWidth(_ width: CGFloat) {
-        mutate { $0.settings.sidebarWidth = Double(min(max(width, 200), 440)) }
+        liveSidebarWidth = min(max(width, 200), 440)
+    }
+
+    func commitSidebarWidth() {
+        guard let width = liveSidebarWidth else { return }
+        mutate { $0.settings.sidebarWidth = Double(width) }
+        liveSidebarWidth = nil
     }
 
     func toggleSidebar() {
@@ -479,7 +653,7 @@ final class BrowserStore {
     func switchSpace(to id: UUID) {
         guard id != state.currentSpaceID, let target = state.spaces.firstIndex(where: { $0.id == id }) else { return }
         spaceTransitionEdge = target > state.currentSpaceIndex ? .trailing : .leading
-        mutate { $0.currentSpaceID = id }
+        mutate { $0.showSpace(id) }
         findBarTabID = nil
         wakeVisibleTabs()
         focusWebContent()
@@ -515,6 +689,7 @@ final class BrowserStore {
         }
     }
 
+    /// Deletes a space without asking. Its tabs go to the archive. Menus use `requestDeleteSpace`.
     func deleteSpace(_ id: UUID) {
         guard let removedTabs = mutate({ $0.removeSpace(withID: id) }) else { return }
         removedTabs.forEach { discardSession($0.id) }
@@ -536,6 +711,15 @@ final class BrowserStore {
         wakeVisibleTabs()
     }
 
+    func renameProfile(_ id: UUID, to name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+        mutate { state in
+            guard let index = state.profiles.firstIndex(where: { $0.id == id }) else { return }
+            state.profiles[index].name = trimmed
+        }
+    }
+
     @discardableResult
     func newProfile() -> UUID {
         let profile = Profile(name: "Profile \(state.profiles.count + 1)")
@@ -547,17 +731,17 @@ final class BrowserStore {
 
     func openInSplit(_ id: UUID) {
         guard let item = state.item(withID: id), !item.isFolder else { return }
-        guard let selected = selectedTabID else {
+        guard selectedTabID != nil else {
             select(id)
             return
         }
-        guard id != selected, state.visibleTabsIncludingCollapsed(inSpace: state.currentSpaceID).contains(id) else { return }
-        mutate { $0.spaces[$0.currentSpaceIndex].splitTabID = id }
+        guard mutate({ $0.setSplit(id) }) else { return }
         ensureSession(for: id)
     }
 
     func closeSplit() {
-        mutate { $0.spaces[$0.currentSpaceIndex].splitTabID = nil }
+        mutate { $0.setSplit(nil) }
+        focusWebContent()
     }
 
     /// Closes the split, or asks what to open beside the current tab.
@@ -577,8 +761,15 @@ final class BrowserStore {
             commandBar = CommandBarRequest(mode: .newTab, initialText: initialText ?? "")
             return
         }
-        let currentURL = mode == .currentTab ? selectedItem?.url?.absoluteString : nil
-        commandBar = CommandBarRequest(mode: mode, initialText: initialText ?? currentURL ?? "")
+        let target = mode == .currentTab ? focusedTabID : nil
+        let currentURL = target.flatMap { state.item(withID: $0)?.url?.absoluteString }
+        commandBar = CommandBarRequest(mode: mode, initialText: initialText ?? currentURL ?? "", targetTabID: target)
+    }
+
+    func requestFindBar() {
+        guard let id = focusedTabID else { return }
+        findBarTabID = id
+        findFocusRequest += 1
     }
 
     func dismissCommandBar() {
@@ -602,6 +793,12 @@ final class BrowserStore {
                 item.url = newURL
             }
         }
+    }
+
+    /// A tab's page process died while it was off screen, usually because macOS reclaimed its
+    /// memory. The tab goes to sleep and reloads when it is next shown, as if it had never loaded.
+    func sessionDidCrashOffScreen(_ id: UUID) {
+        discardSession(id)
     }
 
     func sessionDidFinish(_ id: UUID, title: String, url: URL) {
@@ -635,17 +832,16 @@ final class BrowserStore {
     func showToast(_ text: String, symbol: String = "checkmark.circle.fill") {
         let toast = Toast(text: text, symbol: symbol)
         self.toast = toast
+        if let window {
+            NSAccessibility.post(
+                element: window,
+                notification: .announcementRequested,
+                userInfo: [.announcement: text, .priority: NSAccessibilityPriorityLevel.high.rawValue]
+            )
+        }
         Task { [weak self] in
             try? await Task.sleep(for: .seconds(2.2))
             if self?.toast?.id == toast.id { self?.toast = nil }
         }
-    }
-}
-
-extension BrowserState {
-    /// Ids of every tab reachable from a space, including those inside collapsed folders.
-    func visibleTabsIncludingCollapsed(inSpace spaceID: UUID) -> Set<UUID> {
-        guard let space = space(withID: spaceID) else { return [] }
-        return Set((favorites(forSpace: spaceID).allTabs + space.pinned.allTabs + space.tabs.allTabs).map(\.id))
     }
 }

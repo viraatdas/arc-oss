@@ -48,6 +48,7 @@ struct WebCard: View {
                         }
                         .buttonStyle(.plain)
                         .help("Close Split View")
+                        .accessibilityLabel("Close Split View")
                     }
                 }
                 .padding(10)
@@ -173,10 +174,13 @@ struct FindBar: View {
                 .onExitCommand { close() }
             Button { find(backwards: true) } label: { Image(systemName: "chevron.up") }
                 .help("Previous match")
+                .accessibilityLabel("Previous match")
             Button { find(backwards: false) } label: { Image(systemName: "chevron.down") }
                 .help("Next match")
+                .accessibilityLabel("Next match")
             Button { close() } label: { Image(systemName: "xmark") }
                 .help("Done")
+                .accessibilityLabel("Close find bar")
         }
         .buttonStyle(.plain)
         .font(.system(size: 13))
@@ -189,6 +193,8 @@ struct FindBar: View {
         )
         .shadow(color: .black.opacity(0.2), radius: 8, y: 2)
         .onAppear { isFocused = true }
+        // ⌘F while the bar is already open puts the cursor back in it.
+        .onChange(of: store.findFocusRequest) { isFocused = true }
         .onChange(of: text) { notFound = false }
     }
 

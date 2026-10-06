@@ -280,6 +280,45 @@ private func importFixture() throws -> ArcImportResult {
         #expect(state.spaces[2].profileID == state.profiles[1].id)
     }
 
+    @Test func reimportingAfterMovingThingsDoesNotDuplicateThem() throws {
+        var state = BrowserState.fresh()
+        state.merge(try importFixture())
+        let mail = try #require(state.profiles[0].favorites.first)
+        let home = state.spaces[1]
+        // Move the favorite into a space, then delete the space a pinned tab came from after
+        // moving that tab out of it.
+        state.move(mail.id, to: MoveDestination(spaceID: state.spaces[0].id, section: .pinned, placement: .end))
+        let calendar = try #require(home.pinned.last)
+        state.move(calendar.id, to: MoveDestination(spaceID: state.spaces[0].id, section: .tabs, placement: .end))
+        state.removeSpace(withID: home.id)
+
+        state.merge(try importFixture())
+        let ids = state.spaces.flatMap { $0.pinned.allTabs + $0.tabs.allTabs } + state.profiles.flatMap(\.favorites)
+        #expect(Set(ids.map(\.id)).count == ids.count)
+        #expect(state.profiles[0].favorites.isEmpty)
+        // The deleted space comes back, without the tab that now lives elsewhere.
+        let returned = try #require(state.spaces.first { $0.id == home.id })
+        #expect(!returned.pinned.allTabs.contains { $0.id == calendar.id })
+    }
+
+    @Test func readsTheNewerContainerList() throws {
+        let newer = """
+        {"sidebar": {"containers": [{
+          "spaces": ["S", {"id": "S", "title": "Newer",
+            "newContainerIDs": [{"pinned": {}}, "P", {"unpinned": {"_0": {"shared": {}}}}, "U"]}],
+          "items": [
+            "P", {"id": "P", "childrenIds": ["T"], "data": {"itemContainer": {"containerType": {"spaceItems": {"_0": "S"}}}}},
+            "U", {"id": "U", "childrenIds": ["V"], "data": {"itemContainer": {"containerType": {"spaceItems": {"_0": "S"}}}}},
+            "T", {"id": "T", "childrenIds": [], "data": {"tab": {"savedURL": "https://pinned.example.com/"}}},
+            "V", {"id": "V", "childrenIds": [], "data": {"tab": {"savedURL": "https://open.example.com/"}}}
+          ]
+        }]}}
+        """
+        let space = try ArcImporter.importSidebar(data: Data(newer.utf8)).spaces[0]
+        #expect(space.pinned.map(\.url?.host) == ["pinned.example.com"])
+        #expect(space.tabs.map(\.url?.host) == ["open.example.com"])
+    }
+
     @Test func importingTwiceChangesNothing() throws {
         var state = BrowserState.fresh()
         state.merge(try importFixture())

@@ -77,6 +77,8 @@ enum MainMenu {
             item("Close Tab", #selector(AppDelegate.closeTab(_:)), "w"),
             system("Close Window", #selector(NSWindow.performClose(_:)), "w", [.command, .shift]),
             item("Reopen Closed Tab", #selector(AppDelegate.reopenClosedTab(_:)), "t", [.command, .shift]),
+            separator(),
+            item("Print…", #selector(AppDelegate.printPage(_:)), "p"),
         ])
 
         _ = menu("Edit", [

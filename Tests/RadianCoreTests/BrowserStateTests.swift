@@ -210,6 +210,8 @@ private struct Fixture {
         let removed = fixture.state.removeSpace(withID: fixture.home)
         #expect(removed?.count == 4)
         #expect(fixture.state.currentSpaceID == fixture.other)
+        // Nothing is lost outright: every tab the space held is in the archive, first tab on top.
+        #expect(fixture.state.archive.map(\.title) == ["Nested", "Pinned", "First", "Second"])
         // The last space is not removable.
         let removedLast = fixture.state.removeSpace(withID: fixture.other)
         #expect(removedLast == nil)
@@ -275,9 +277,253 @@ private struct Fixture {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try Data("{ truncated".utf8).write(to: file.url)
 
-        #expect(file.loadOrQuarantine() == nil)
+        guard case .setAside(let destination) = file.loadOrSetAside() else {
+            Issue.record("expected the file to be set aside")
+            return
+        }
         let remaining = try FileManager.default.contentsOfDirectory(atPath: directory.path)
-        #expect(remaining.count == 1)
-        #expect(remaining[0].contains("corrupt"))
+        #expect(remaining == [destination.lastPathComponent])
+        #expect(remaining[0].contains("unreadable"))
+        let contents = try String(contentsOf: destination, encoding: .utf8)
+        #expect(contents == "{ truncated")
+    }
+}
+
+@Suite struct SelectionTests {
+    private let start = Date(timeIntervalSince1970: 1_800_000_000)
+
+    @Test func leavingATabRestartsItsArchiveClock() {
+        var fixture = Fixture()
+        fixture.state.select(fixture.first.id, now: start)
+        // Read for 13 hours, then move on. The tab was seen just now, so it is not stale.
+        let later = start.addingTimeInterval(13 * 3600)
+        fixture.state.select(fixture.second.id, now: later)
+        #expect(fixture.state.item(withID: fixture.first.id)?.lastActiveAt == later)
+        let archived = fixture.state.archiveStaleTabs(now: later.addingTimeInterval(600))
+        #expect(archived.isEmpty)
+    }
+
+    @Test func switchingSpacesAndClosingTheSplitAlsoCount() {
+        var fixture = Fixture()
+        fixture.state.select(fixture.first.id, now: start)
+        let opened = fixture.state.setSplit(fixture.second.id, now: start)
+        #expect(opened)
+        let later = start.addingTimeInterval(20 * 3600)
+        fixture.state.showSpace(fixture.other, now: later)
+        #expect(fixture.state.item(withID: fixture.first.id)?.lastActiveAt == later)
+        #expect(fixture.state.item(withID: fixture.second.id)?.lastActiveAt == later)
+    }
+
+    @Test func unpinningATabStartsItsClockAfresh() {
+        var fixture = Fixture()
+        fixture.state.updateItem(withID: fixture.pinned.id) { $0.lastActiveAt = self.start }
+        let later = start.addingTimeInterval(3 * 86_400)
+        fixture.state.move(fixture.pinned.id, to: MoveDestination(spaceID: fixture.home, section: .tabs, placement: .end), now: later)
+        let archived = fixture.state.archiveStaleTabs(now: later.addingTimeInterval(600))
+        // The fixture's other tabs are stale on this clock; the one just unpinned must not be.
+        #expect(!archived.contains(fixture.pinned.id))
+        #expect(fixture.state.spaces[0].tabs.contains { $0.id == fixture.pinned.id })
+    }
+
+    @Test func selectingTheSplitTabSwapsThePanes() {
+        var fixture = Fixture()
+        fixture.state.select(fixture.first.id, now: start)
+        fixture.state.setSplit(fixture.second.id, now: start)
+        fixture.state.select(fixture.second.id, now: start)
+        #expect(fixture.state.spaces[0].selectedTabID == fixture.second.id)
+        #expect(fixture.state.spaces[0].splitTabID == fixture.first.id)
+    }
+
+    @Test func splitRefusesTabsFromOtherSpacesAndTheSelectedTab() {
+        var fixture = Fixture()
+        let foreign = SidebarItem.tab(url: URL(string: "https://elsewhere.example.com/")!)
+        fixture.state.spaces[1].tabs = [foreign]
+        let withoutSelection = fixture.state.setSplit(fixture.second.id, now: start)
+        #expect(!withoutSelection)
+        fixture.state.select(fixture.first.id, now: start)
+        let withItself = fixture.state.setSplit(fixture.first.id, now: start)
+        let withForeign = fixture.state.setSplit(foreign.id, now: start)
+        #expect(!withItself)
+        #expect(!withForeign)
+    }
+
+    @Test func closingAnUnpinnedTabArchivesIt() {
+        var fixture = Fixture()
+        fixture.state.select(fixture.first.id, now: start)
+        fixture.state.setSplit(fixture.second.id, now: start)
+        let outcome = fixture.state.close(fixture.first.id, now: start)
+        guard case .archived(let entryID) = outcome else {
+            Issue.record("expected the tab to be archived, got \(String(describing: outcome))")
+            return
+        }
+        #expect(fixture.state.archive.first?.id == entryID)
+        #expect(fixture.state.spaces[0].tabs.map(\.title) == ["Second"])
+        // The other pane takes over the window.
+        #expect(fixture.state.spaces[0].selectedTabID == fixture.second.id)
+        #expect(fixture.state.spaces[0].splitTabID == nil)
+    }
+
+    @Test func closingAPinnedTabSendsItHome() {
+        var fixture = Fixture()
+        fixture.state.updateItem(withID: fixture.pinned.id) { $0.url = URL(string: "https://pinned.example.com/deep/page")! }
+        let outcome = fixture.state.close(fixture.pinned.id, now: start)
+        #expect(outcome == .unloaded)
+        #expect(fixture.state.item(withID: fixture.pinned.id)?.url == fixture.pinned.url)
+        #expect(fixture.state.archive.isEmpty)
+    }
+
+    @Test func deletingAFolderArchivesItsTabs() {
+        var fixture = Fixture()
+        fixture.state.select(fixture.nested.id, now: start)
+        let removed = fixture.state.deleteItem(withID: fixture.folder.id, now: start)
+        #expect(removed?.id == fixture.folder.id)
+        #expect(fixture.state.archive.map(\.title) == ["Nested"])
+        #expect(fixture.state.spaces[0].selectedTabID == nil)
+    }
+
+    @Test func restoringATabFromADeletedSpaceUsesTheCurrentOne() throws {
+        var fixture = Fixture()
+        fixture.state.removeSpace(withID: fixture.home, now: start)
+        let entry = try #require(fixture.state.archive.first)
+        let restoredID = fixture.state.restoreArchived(entry.id, now: start)
+        let restored = try #require(restoredID)
+        #expect(fixture.state.spaces[0].id == fixture.other)
+        #expect(fixture.state.spaces[0].tabs.map(\.id) == [restored])
+        #expect(!fixture.state.archive.contains { $0.id == entry.id })
+    }
+}
+
+@Suite struct RepairRuleTests {
+    @Test func repairRemovesDuplicatesAndMovesFoldersOutOfTheTabList() {
+        var fixture = Fixture()
+        // A folder in the unpinned list, and the same tab twice.
+        fixture.state.spaces[0].tabs.append(.folder(name: "Stray", children: [.tab(url: URL(string: "https://stray.example.com/")!, title: "Stray tab")]))
+        fixture.state.profiles[0].favorites = [fixture.first]
+        fixture.state.repair()
+        let tabs = fixture.state.spaces[0].tabs
+        #expect(tabs.map(\.title) == ["First", "Second", "Stray tab"])
+        #expect(!tabs.contains { $0.isFolder })
+        #expect(fixture.state.profiles[0].favorites.isEmpty)
+        #expect(fixture.state.allItemIDs.count == 6)
+    }
+
+    @Test func theSweepNeverDropsWhatItCannotArchive() {
+        var fixture = Fixture()
+        let old = Date(timeIntervalSince1970: 1_000)
+        var stray = SidebarItem.folder(name: "Stray", children: [.tab(url: URL(string: "https://x.example.com/")!)])
+        stray.lastActiveAt = old
+        fixture.state.spaces[0].tabs.append(stray)
+        fixture.state.archiveStaleTabs(now: Date(timeIntervalSince1970: 1_800_000_000))
+        #expect(fixture.state.spaces[0].tabs.contains { $0.id == stray.id })
+    }
+}
+
+@Suite struct DecodingTests {
+    private func decode(_ json: String) throws -> BrowserState {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode(BrowserState.self, from: Data(json.utf8))
+    }
+
+    private let profile = "11111111-1111-1111-1111-111111111111"
+    private let space = "22222222-2222-2222-2222-222222222222"
+
+    @Test func readsEveryField() throws {
+        let state = try decode("""
+        {
+          "schemaVersion": 1,
+          "currentSpaceID": "\(space)",
+          "profiles": [{ "id": "\(profile)", "name": "Work", "favorites": [
+            { "id": "33333333-3333-3333-3333-333333333333", "kind": "tab", "title": "Mail",
+              "url": "https://mail.example.com/inbox", "homeURL": "https://mail.example.com/",
+              "children": [], "isExpanded": false,
+              "createdAt": "2026-01-01T00:00:00Z", "lastActiveAt": "2026-01-02T00:00:00Z" }
+          ] }],
+          "spaces": [{
+            "id": "\(space)", "name": "Home", "profileID": "\(profile)",
+            "icon": { "emoji": { "_0": "🌊" } },
+            "theme": { "colors": [{ "red": 1, "green": 0, "blue": 0, "alpha": 1 }], "intensity": 0.5 },
+            "pinned": [{ "id": "44444444-4444-4444-4444-444444444444", "kind": "folder", "title": "Reading",
+              "isExpanded": true, "createdAt": "2026-01-01T00:00:00Z", "lastActiveAt": "2026-01-01T00:00:00Z",
+              "children": [{ "id": "55555555-5555-5555-5555-555555555555", "kind": "tab", "title": "Guide",
+                "customTitle": "Mine", "url": "https://docs.example.com/", "homeURL": "https://docs.example.com/",
+                "children": [], "isExpanded": false,
+                "createdAt": "2026-01-01T00:00:00Z", "lastActiveAt": "2026-01-01T00:00:00Z" }] }],
+            "tabs": [],
+            "selectedTabID": "55555555-5555-5555-5555-555555555555"
+          }],
+          "archive": [{ "id": "66666666-6666-6666-6666-666666666666", "title": "Old", "url": "https://old.example.com/",
+            "spaceID": "\(space)", "archivedAt": "2026-01-03T00:00:00Z" }],
+          "settings": { "searchEngine": "kagi", "archiveAfterHours": null, "sidebarWidth": 300 }
+        }
+        """)
+        let home = try #require(state.spaces.first)
+        let favorite = try #require(state.profiles.first?.favorites.first)
+        let guide = try #require(home.pinned.first?.children.first)
+        #expect(state.currentSpaceID.uuidString == space)
+        #expect(favorite.homeURL?.absoluteString == "https://mail.example.com/")
+        #expect(favorite.url?.path == "/inbox")
+        #expect(home.icon == .emoji("🌊"))
+        #expect(home.theme.colors == [RGBAColor(red: 1, green: 0, blue: 0)])
+        #expect(home.pinned.first?.isExpanded == true)
+        #expect(guide.customTitle == "Mine")
+        #expect(home.selectedTabID == guide.id)
+        #expect(state.archive.map(\.title) == ["Old"])
+        #expect(state.settings.searchEngine == .kagi)
+        #expect(state.settings.archiveAfterHours == nil)
+        #expect(state.settings.sidebarWidth == 300)
+    }
+
+    @Test func skipsWhatItCannotReadAndKeepsTheRest() throws {
+        let state = try decode("""
+        {
+          "schemaVersion": 7,
+          "currentSpaceID": "\(space)",
+          "profiles": [{ "id": "\(profile)" }],
+          "spaces": [
+            { "id": "\(space)", "profileID": "\(profile)", "icon": { "hologram": {} },
+              "pinned": [
+                { "id": "44444444-4444-4444-4444-444444444444", "kind": "board", "title": "From the future" },
+                { "id": "55555555-5555-5555-5555-555555555555", "kind": "tab", "url": "https://kept.example.com/" }
+              ] },
+            { "name": "No id" }
+          ],
+          "archive": [{ "title": "No address" }]
+        }
+        """)
+        #expect(state.schemaVersion == 7)
+        #expect(state.spaces.count == 1)
+        let kept = try #require(state.spaces[0].pinned.first)
+        #expect(state.spaces[0].pinned.count == 1)
+        #expect(kept.url?.host == "kept.example.com")
+        #expect(kept.title == "")
+        #expect(state.spaces[0].name == "Space")
+        #expect(state.spaces[0].icon == .symbol("circle.fill"))
+        #expect(state.profiles[0].name == "Profile")
+        #expect(state.archive.isEmpty)
+        #expect(state.settings == Settings())
+    }
+
+    @Test func refusesAFileWhoseSpacesAreAllUnreadable() {
+        #expect(throws: DecodingError.self) {
+            try decode(#"{ "spaces": [{ "name": "No id" }], "profiles": [] }"#)
+        }
+    }
+}
+
+@Suite struct ThemeTests {
+    @Test func samplesTheGradientAlongItsLength() {
+        let theme = SpaceTheme(colors: [RGBAColor(red: 0, green: 0, blue: 0), RGBAColor(red: 1, green: 1, blue: 1)])
+        #expect(theme.color(at: 0) == RGBAColor(red: 0, green: 0, blue: 0))
+        #expect(theme.color(at: 0.5).red == 0.5)
+        #expect(theme.color(at: 2) == RGBAColor(red: 1, green: 1, blue: 1))
+    }
+
+    @Test func sidebarBrightnessFollowsTheStartOfTheGradient() {
+        let blackToWhite = SpaceTheme(colors: [RGBAColor(red: 0, green: 0, blue: 0), RGBAColor(red: 1, green: 1, blue: 1)])
+        let whiteToBlack = SpaceTheme(colors: [RGBAColor(red: 1, green: 1, blue: 1), RGBAColor(red: 0, green: 0, blue: 0)])
+        // Their averages are identical, but the sidebar sits over the first color.
+        #expect(blackToWhite.sidebarLuminance < 0.2)
+        #expect(whiteToBlack.sidebarLuminance > 0.5)
     }
 }

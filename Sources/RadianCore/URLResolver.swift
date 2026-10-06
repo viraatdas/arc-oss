@@ -26,12 +26,12 @@ public enum URLResolver {
     /// more likely a search ("error: unexpected token") than an address.
     private static let externalSchemes: Set<String> = ["mailto", "tel", "sms", "facetime", "facetime-audio", "maps"]
 
-    /// Endings that look like a top-level domain but are far more often a file name ("main.swift").
-    private static let fileExtensions: Set<String> = [
-        "js", "ts", "jsx", "tsx", "json", "txt", "png", "jpg", "jpeg", "gif", "svg", "css", "html", "htm",
-        "php", "swift", "cpp", "java", "kt", "rb", "exe", "pdf", "yml", "yaml", "toml", "lock", "log",
-        "conf", "cfg", "ini", "xml", "csv",
-    ]
+    /// Real top-level domains that are far more often typed as a file name ("readme.md", "main.py").
+    /// Endings with popular sites of their own (".ai", ".so", ".sh") are deliberately left out.
+    private static let fileExtensions: Set<Substring> = ["md", "py", "rs", "ps", "zip", "mov"]
+
+    /// Endings used on local networks. Devices there rarely serve https.
+    private static let localSuffixes: Set<Substring> = ["local", "lan", "home", "internal", "localhost", "test"]
 
     /// Decides whether `raw` is an address or a search. Returns nil for blank input.
     public static func resolve(_ raw: String, engine: SearchEngine) -> InputResolution? {
@@ -40,21 +40,22 @@ public enum URLResolver {
 
         func search() -> InputResolution { .search(engine.searchURL(for: input), query: input) }
 
-        guard !input.contains(where: \.isWhitespace) else { return search() }
-
         if let scheme = explicitScheme(in: input) {
+            let isWeb = webSchemes.contains(scheme)
+            let isDeepLink = input.dropFirst(scheme.count).hasPrefix("://")
+            guard isWeb || externalSchemes.contains(scheme) || isDeepLink else { return search() }
+            // A pasted path can contain spaces ("file:///Users/me/My Site/index.html").
+            let encoded = input.replacingOccurrences(of: " ", with: "%20")
+            guard !encoded.contains(where: \.isWhitespace), let url = URL(string: encoded) else { return search() }
             // Web pages load here; app links such as "mailto:" or "slack://" are handed to the
             // system by the caller.
-            let isDeepLink = input.dropFirst(scheme.count).hasPrefix("://")
-            if webSchemes.contains(scheme) || externalSchemes.contains(scheme) || isDeepLink,
-               let url = URL(string: input) {
-                return .url(url)
-            }
-            return search()
+            return .url(url)
         }
 
-        guard let host = hostPortion(of: input), let scheme = impliedScheme(forHost: host) else { return search() }
-        guard let url = URL(string: "\(scheme)://\(input)"), url.host != nil else { return search() }
+        guard !input.contains(where: \.isWhitespace), let authority = authority(of: input),
+              let scheme = impliedScheme(forHost: authority.host, hasPort: authority.hasPort),
+              let url = URL(string: "\(scheme)://\(input)"), url.host != nil
+        else { return search() }
         return .url(url)
     }
 
@@ -71,34 +72,43 @@ public enum URLResolver {
         return candidate.lowercased()
     }
 
-    /// The part before the path, without any port.
-    private static func hostPortion(of input: String) -> String? {
+    /// The host before any path, and whether a numeric port follows it.
+    private static func authority(of input: String) -> (host: Substring, hasPort: Bool)? {
         let authority = input.prefix { $0 != "/" && $0 != "?" && $0 != "#" }
         guard !authority.isEmpty, !authority.contains("@") else { return nil }
         if authority.hasPrefix("[") {
-            return authority.contains("]") ? String(authority) : nil
+            return authority.contains("]") ? (authority, false) : nil
         }
         let parts = authority.split(separator: ":", omittingEmptySubsequences: false)
         guard parts.count <= 2, let host = parts.first, !host.isEmpty else { return nil }
-        if parts.count == 2, !(parts[1].allSatisfy(\.isNumber) && !parts[1].isEmpty) { return nil }
-        return String(host)
+        if parts.count == 2 {
+            guard !parts[1].isEmpty, parts[1].allSatisfy(\.isNumber) else { return nil }
+            return (host, true)
+        }
+        return (host, false)
     }
 
     /// The scheme to assume for a bare host, or nil when the text does not look like a host at all.
-    private static func impliedScheme(forHost host: String) -> String? {
+    private static func impliedScheme(forHost host: Substring, hasPort: Bool) -> String? {
         let lowered = host.lowercased()
-        if lowered == "localhost" || lowered.hasSuffix(".localhost") || lowered.hasPrefix("[") { return "http" }
+        if lowered.hasPrefix("[") { return "http" }
 
         let labels = lowered.split(separator: ".", omittingEmptySubsequences: false)
-        guard labels.count >= 2, labels.allSatisfy({ !$0.isEmpty }) else { return nil }
+        guard labels.allSatisfy({ !$0.isEmpty }) else { return nil }
+        let isHostLike = labels.allSatisfy { label in
+            label.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" } && label.first != "-" && label.last != "-"
+        }
+        guard isHostLike, let tld = labels.last else { return nil }
 
         if labels.count == 4, labels.allSatisfy({ $0.allSatisfy(\.isNumber) && (Int($0) ?? 256) <= 255 }) {
             return "http"
         }
-        guard labels.allSatisfy({ label in label.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" } }),
-              let tld = labels.last, tld.count >= 2, tld.allSatisfy(\.isLetter),
-              !fileExtensions.contains(String(tld))
-        else { return nil }
+        if lowered == "localhost" || localSuffixes.contains(tld) { return "http" }
+        // "devbox:3000": a bare machine name is only an address when it comes with a port.
+        if labels.count == 1 { return hasPort ? "http" : nil }
+
+        if tld.contains(where: { !$0.isASCII }) { return "https" }
+        guard TopLevelDomains.all.contains(tld), !fileExtensions.contains(tld) || hasPort else { return nil }
         return "https"
     }
 }

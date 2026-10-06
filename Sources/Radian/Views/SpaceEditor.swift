@@ -6,6 +6,9 @@ struct SpaceEditor: View {
     @Environment(BrowserStore.self) private var store
     let spaceID: UUID
 
+    @State private var profileName = ""
+    @State private var isConfirmingDelete = false
+
     private static let symbols = [
         "house.fill", "briefcase.fill", "bolt.fill", "star.fill", "heart.fill", "book.fill", "leaf.fill",
         "moon.fill", "flame.fill", "sparkles", "globe.americas.fill", "music.note", "gamecontroller.fill",
@@ -29,6 +32,8 @@ struct SpaceEditor: View {
                             } action: {
                                 store.updateSpace(spaceID) { $0.icon = .symbol(symbol) }
                             }
+                            .accessibilityLabel(SpaceEditor.spokenName(of: symbol))
+                            .accessibilityAddTraits(space.icon == .symbol(symbol) ? .isSelected : [])
                         }
                     }
                     HStack {
@@ -43,7 +48,7 @@ struct SpaceEditor: View {
 
                 section("Theme") {
                     HStack(spacing: 8) {
-                        ForEach(Array(SpaceTheme.presets.enumerated()), id: \.offset) { _, preset in
+                        ForEach(Array(SpaceTheme.presets.enumerated()), id: \.offset) { index, preset in
                             Button {
                                 store.updateSpace(spaceID) { $0.theme = preset }
                             } label: {
@@ -55,6 +60,8 @@ struct SpaceEditor: View {
                                     )
                             }
                             .buttonStyle(.plain)
+                            .accessibilityLabel("Theme \(index + 1)")
+                            .accessibilityAddTraits(space.theme.colors == preset.colors ? .isSelected : [])
                         }
                     }
                     HStack(spacing: 14) {
@@ -82,18 +89,31 @@ struct SpaceEditor: View {
                             store.setProfile(store.newProfile(), forSpace: spaceID)
                         }
                     }
+                    TextField("Profile name", text: $profileName)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { commitProfileName(space) }
                     Text("Spaces on the same profile share logins and favorites.")
                         .font(.system(size: 11.5))
                         .foregroundStyle(.secondary)
                 }
 
                 HStack {
-                    Button("Delete Space", role: .destructive) {
-                        store.deleteSpace(spaceID)
+                    Button("Delete Space…", role: .destructive) {
+                        isConfirmingDelete = true
                     }
                     .disabled(store.state.spaces.count < 2)
+                    .confirmationDialog(
+                        store.describe(.space(spaceID)).title,
+                        isPresented: $isConfirmingDelete
+                    ) {
+                        Button("Delete Space", role: .destructive) { store.deleteSpace(spaceID) }
+                        Button("Cancel", role: .cancel) {}
+                    } message: {
+                        Text(store.describe(.space(spaceID)).message)
+                    }
                     Spacer()
                     Button("Done") {
+                        commitProfileName(space)
                         store.editingSpaceID = nil
                     }
                     .keyboardShortcut(.defaultAction)
@@ -101,7 +121,22 @@ struct SpaceEditor: View {
             }
             .padding(22)
             .frame(width: 390)
+            .onAppear { loadProfileName(space) }
+            .onChange(of: space.profileID) { loadProfileName(space) }
         }
+    }
+
+    private func loadProfileName(_ space: Space) {
+        profileName = store.state.profiles.first { $0.id == space.profileID }?.name ?? ""
+    }
+
+    private func commitProfileName(_ space: Space) {
+        store.renameProfile(space.profileID, to: profileName)
+    }
+
+    /// "graduationcap.fill" becomes "graduationcap".
+    static func spokenName(of symbol: String) -> String {
+        symbol.replacingOccurrences(of: ".fill", with: "").replacingOccurrences(of: ".", with: " ")
     }
 
     private func section<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {

@@ -5,6 +5,7 @@ import SwiftUI
 struct ArchiveView: View {
     @Environment(BrowserStore.self) private var store
     @State private var query = ""
+    @State private var isConfirmingClear = false
 
     private static let archiveOptions: [(label: String, hours: Double?)] = [
         ("12 hours", 12), ("24 hours", 24), ("7 days", 168), ("30 days", 720), ("Never", nil),
@@ -18,13 +19,17 @@ struct ArchiveView: View {
                 Text("Archive")
                     .font(.headline)
                 Spacer()
+                // Escape, not Return: Return in the search field restores the top match.
                 Button("Done") { store.isArchivePresented = false }
-                    .keyboardShortcut(.defaultAction)
+                    .keyboardShortcut(.cancelAction)
             }
             .padding([.horizontal, .top], 18)
 
             TextField("Search archived tabs", text: $query)
                 .textFieldStyle(.roundedBorder)
+                .onSubmit {
+                    if let first = entries.first { restore(first) }
+                }
                 .padding(.horizontal, 18)
                 .padding(.vertical, 12)
 
@@ -36,12 +41,11 @@ struct ArchiveView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 List(entries) { entry in
-                    ArchiveRow(entry: entry)
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            store.isArchivePresented = false
-                            store.restoreArchived(entry.id)
-                        }
+                    Button { restore(entry) } label: {
+                        ArchiveRow(entry: entry).contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityHint("Restores the tab")
                 }
                 .listStyle(.plain)
             }
@@ -56,14 +60,25 @@ struct ArchiveView: View {
                 }
                 .fixedSize()
                 Spacer()
-                Button("Clear Archive") { store.clearArchive() }
+                Button("Clear Archive…") { isConfirmingClear = true }
                     .disabled(store.state.archive.isEmpty)
+                    .confirmationDialog("Clear the archive?", isPresented: $isConfirmingClear) {
+                        Button("Clear Archive", role: .destructive) { store.clearArchive() }
+                        Button("Cancel", role: .cancel) {}
+                    } message: {
+                        Text("All \(store.state.archive.count) archived tabs will be deleted. This cannot be undone.")
+                    }
             }
             .font(.system(size: 12))
             .padding(.horizontal, 18)
             .padding(.vertical, 12)
         }
         .frame(width: 540, height: 540)
+    }
+
+    private func restore(_ entry: ArchivedTab) {
+        store.isArchivePresented = false
+        store.restoreArchived(entry.id)
     }
 
     private var filteredEntries: [ArchivedTab] {

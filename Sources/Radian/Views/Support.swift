@@ -30,7 +30,7 @@ extension SpaceTheme {
     /// Whether sidebar text should be light or dark to stay readable over this theme.
     func contentScheme(system: ColorScheme) -> ColorScheme {
         let base = system == .dark ? 0.03 : 0.9
-        let blended = base * (1 - tintOpacity) + averageLuminance * tintOpacity
+        let blended = base * (1 - tintOpacity) + sidebarLuminance * tintOpacity
         return blended < 0.36 ? .dark : .light
     }
 }
@@ -146,6 +146,12 @@ struct ChromeButton: View {
         .disabled(!isEnabled)
         .onHover { isHovering = $0 }
         .help(help)
+        .accessibilityLabel(ChromeButton.spokenLabel(for: help))
+    }
+
+    /// "Reload (⌘R)" reads better without the shortcut.
+    static func spokenLabel(for help: String) -> String {
+        help.replacingOccurrences(of: #"\s*\([^)]*\)$"#, with: "", options: .regularExpression)
     }
 }
 

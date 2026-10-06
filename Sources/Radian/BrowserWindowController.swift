@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 @MainActor
-final class BrowserWindowController: NSWindowController {
+final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     private let store: BrowserStore
     private var scrollMonitor: Any?
     private var swipe = SwipeTracker()
@@ -26,6 +26,7 @@ final class BrowserWindowController: NSWindowController {
         window.center()
         window.setFrameAutosaveName("RadianMainWindow")
         super.init(window: window)
+        window.delegate = self
 
         store.window = window
         store.applyWindowChrome()
@@ -35,6 +36,11 @@ final class BrowserWindowController: NSWindowController {
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) is not supported")
+    }
+
+    /// Closing the window only hides it, so its pages are told to stop playing.
+    func windowWillClose(_ notification: Notification) {
+        store.windowDidHide()
     }
 
     /// Two-finger horizontal swipes over the sidebar move between spaces.

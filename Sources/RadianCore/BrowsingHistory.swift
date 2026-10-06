@@ -65,13 +65,35 @@ public struct BrowsingHistory: Codable, Equatable, Sendable {
             .map(\.entry)
     }
 
-    /// The most-visited page whose host begins with `prefix`, for "type gi, get github.com".
+    /// The most-visited site whose host begins with `prefix`, for "type gi, get github.com".
+    /// Visits are added up across each site's pages, and the site's front page is what is offered.
     public func bestHostMatch(forPrefix prefix: String) -> HistoryEntry? {
         let needle = prefix.lowercased()
         guard needle.count >= 2 else { return nil }
-        return entries.values
-            .filter { BrowsingHistory.bareHost($0.url).hasPrefix(needle) }
-            .max { ($0.visitCount, $0.lastVisited) < ($1.visitCount, $1.lastVisited) }
+
+        var sites: [String: [HistoryEntry]] = [:]
+        for entry in entries.values {
+            let host = BrowsingHistory.bareHost(entry.url)
+            if host.hasPrefix(needle) { sites[host, default: []].append(entry) }
+        }
+        func weight(_ pages: [HistoryEntry]) -> (Int, Date) {
+            (pages.reduce(0) { $0 + $1.visitCount }, pages.map(\.lastVisited).max() ?? .distantPast)
+        }
+        guard let (_, pages) = sites.max(by: { weight($0.value) < weight($1.value) }),
+              let busiest = pages.max(by: { $0.visitCount < $1.visitCount })
+        else { return nil }
+
+        let (visits, lastVisited) = weight(pages)
+        if let front = pages.first(where: { ["", "/"].contains($0.url.path) && $0.url.query == nil }) {
+            return HistoryEntry(url: front.url, title: front.title, visitCount: visits, lastVisited: lastVisited)
+        }
+        var components = URLComponents()
+        components.scheme = busiest.url.scheme
+        components.host = busiest.url.host
+        components.port = busiest.url.port
+        components.path = "/"
+        guard let url = components.url else { return busiest }
+        return HistoryEntry(url: url, title: url.host ?? "", visitCount: visits, lastVisited: lastVisited)
     }
 
     /// A URL the way people type it: no scheme, no "www.", no trailing slash.

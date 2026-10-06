@@ -185,8 +185,11 @@ grid.
   intensity is raised so the theme stays visible.
 - Pinned containers keep their folder tree. Split views dissolve into their tabs.
 - Unpinned tabs and favorites are flattened, because Radian keeps folders only in the pinned section.
-- Arc's ids become Radian's ids. Ids that are not UUIDs are hashed to a stable UUID, so importing
-  twice adds nothing the second time and never overwrites changes made since.
+- Containers are found through `containerIDs`, falling back to `newContainerIDs`.
+- Arc's ids become Radian's ids. Ids that are not UUIDs are hashed to a stable UUID. An item whose
+  id already exists anywhere in Radian is skipped, so importing again never duplicates anything or
+  overwrites changes made since, even for tabs the user has moved to another space. Spaces and
+  favorites deleted in Radian do come back.
 - Spaces and favorites on Arc's default profile join Radian's default profile. Each custom Arc
   profile becomes its own Radian profile.
 - The onboarding card, `arc://` pages and anything unrecognized are skipped and counted.

@@ -3,7 +3,7 @@ import RadianCore
 import UniformTypeIdentifiers
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private let store = BrowserStore()
     private var windowController: BrowserWindowController?
 
@@ -15,23 +15,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         store.start()
         NSApp.activate(ignoringOtherApps: true)
 
-        if store.isFirstLaunch {
+        if let notice = store.stateNotice {
+            explain(notice)
+        } else if store.isFirstLaunch {
             offerArcImport()
         }
     }
 
     /// Links clicked in other apps arrive here when Radian is the default browser.
     func application(_ application: NSApplication, open urls: [URL]) {
+        showWindow()
         for url in urls {
             store.open(url, mode: .newTab)
         }
-        windowController?.showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
         if !hasVisibleWindows {
-            windowController?.showWindow(nil)
+            showWindow()
         }
         return true
     }
@@ -63,50 +65,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func closeTab(_ sender: Any?) {
         // ⌘W closes whatever is frontmost: a sheet or panel first, then the tab.
         if let keyWindow = NSApp.keyWindow, keyWindow !== windowController?.window {
-            keyWindow.performClose(sender)
+            if let session = store.session(presentingDialogIn: keyWindow) {
+                // A page's own dialog cannot be closed, only answered. Closing the tab behind it
+                // is the way out of a page that keeps showing them.
+                session.dismissDialog()
+                store.closeTab(session.id)
+            } else {
+                keyWindow.performClose(sender)
+            }
         } else if store.commandBar != nil {
             store.dismissCommandBar()
         } else {
-            store.closeSelectedTab()
+            store.closeFocusedTab()
         }
     }
+
+    @objc func printPage(_ sender: Any?) { store.focusedSession?.printPage() }
 
     @objc func reopenClosedTab(_ sender: Any?) { store.reopenClosedTab() }
     @objc func newFolder(_ sender: Any?) { store.newFolder() }
 
     // MARK: - Edit
 
-    @objc func findInPage(_ sender: Any?) {
-        store.findBarTabID = store.selectedTabID
-    }
+    @objc func findInPage(_ sender: Any?) { store.requestFindBar() }
 
     @objc func copyLink(_ sender: Any?) {
-        if let id = store.selectedTabID { store.copyLink(of: id) }
+        if let id = store.focusedTabID { store.copyLink(of: id) }
     }
 
     // MARK: - View
 
     @objc func toggleSidebar(_ sender: Any?) { store.toggleSidebar() }
-    @objc func reloadPage(_ sender: Any?) { store.selectedSession?.reload() }
-    @objc func stopLoading(_ sender: Any?) { store.selectedSession?.stop() }
-    @objc func zoomIn(_ sender: Any?) { store.selectedSession?.zoom(by: 0.1) }
-    @objc func zoomOut(_ sender: Any?) { store.selectedSession?.zoom(by: -0.1) }
-    @objc func actualSize(_ sender: Any?) { store.selectedSession?.resetZoom() }
+    // Page commands act on whichever split pane has keyboard focus.
+    @objc func reloadPage(_ sender: Any?) { store.focusedSession?.reload() }
+    @objc func stopLoading(_ sender: Any?) { store.focusedSession?.stop() }
+    @objc func zoomIn(_ sender: Any?) { store.focusedSession?.zoom(by: 0.1) }
+    @objc func zoomOut(_ sender: Any?) { store.focusedSession?.zoom(by: -0.1) }
+    @objc func actualSize(_ sender: Any?) { store.focusedSession?.resetZoom() }
     @objc func toggleSplit(_ sender: Any?) { store.toggleSplit() }
 
     // MARK: - Tabs
 
-    @objc func goBack(_ sender: Any?) { store.selectedSession?.goBack() }
-    @objc func goForward(_ sender: Any?) { store.selectedSession?.goForward() }
+    @objc func goBack(_ sender: Any?) { store.focusedSession?.goBack() }
+    @objc func goForward(_ sender: Any?) { store.focusedSession?.goForward() }
     @objc func nextTab(_ sender: Any?) { store.selectAdjacentTab(offset: 1) }
     @objc func previousTab(_ sender: Any?) { store.selectAdjacentTab(offset: -1) }
 
     @objc func togglePin(_ sender: Any?) {
-        if let id = store.selectedTabID { store.togglePin(id) }
+        if let id = store.focusedTabID { store.togglePin(id) }
     }
 
     @objc func addToFavorites(_ sender: Any?) {
-        if let id = store.selectedTabID { store.addToFavorites(id) }
+        if let id = store.focusedTabID { store.addToFavorites(id) }
     }
 
     /// The menu item's tag is the zero-based position of the tab.
@@ -196,7 +206,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let alert = NSAlert()
         alert.messageText = "Bring your spaces over from Arc?"
         alert.informativeText = "Radian found Arc on this Mac. It can copy your spaces, pinned tabs, folders "
-            + "and favorites. Arc itself is not changed, and you can do this later from the File menu."
+            + "and favorites. Arc itself is not changed, and you can do this later from the Radian menu."
         alert.addButton(withTitle: "Import")
         alert.addButton(withTitle: "Not Now")
         alert.beginSheetModal(for: window) { [weak self] response in
@@ -205,15 +215,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func present(_ alert: NSAlert) {
+    private func present(_ alert: NSAlert, then handler: ((NSApplication.ModalResponse) -> Void)? = nil) {
         if let window = windowController?.window, window.isVisible {
-            alert.beginSheetModal(for: window)
+            alert.beginSheetModal(for: window) { response in handler?(response) }
         } else {
-            alert.runModal()
+            handler?(alert.runModal())
         }
     }
 
     private func showWindow() {
         windowController?.showWindow(nil)
+        store.windowDidShow()
+    }
+
+    /// Tells the user what happened to saved state that could not be used as it was.
+    private func explain(_ notice: StateNotice) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        switch notice {
+        case .unreadable(let location):
+            alert.messageText = "Radian couldn’t read its saved spaces"
+            alert.informativeText = "It has started with a fresh window. Nothing was deleted: the saved file was kept "
+                + "as “\(location.lastPathComponent)” so it can be recovered."
+            alert.addButton(withTitle: "OK")
+            alert.addButton(withTitle: "Show in Finder")
+            present(alert) { response in
+                if response == .alertSecondButtonReturn {
+                    NSWorkspace.shared.activateFileViewerSelecting([location])
+                }
+            }
+        case .newerVersion(let backup):
+            alert.messageText = "These spaces were saved by a newer version of Radian"
+            alert.informativeText = "Anything this version does not understand may be lost when it saves. "
+                + (backup.map { "A copy of the original was kept as “\($0.lastPathComponent)”." } ?? "")
+            present(alert)
+        }
+    }
+
+    // MARK: - Menu validation
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        let windowIsOpen = windowController?.window?.isVisible == true
+        switch menuItem.action {
+        case #selector(reloadPage(_:)), #selector(stopLoading(_:)), #selector(zoomIn(_:)), #selector(zoomOut(_:)),
+             #selector(actualSize(_:)), #selector(printPage(_:)), #selector(findInPage(_:)):
+            return windowIsOpen && store.focusedSession != nil
+        case #selector(goBack(_:)):
+            return windowIsOpen && store.focusedSession?.canGoBack == true
+        case #selector(goForward(_:)):
+            return windowIsOpen && store.focusedSession?.canGoForward == true
+        case #selector(closeTab(_:)):
+            return NSApp.keyWindow != nil || windowIsOpen
+        case #selector(copyLink(_:)), #selector(togglePin(_:)), #selector(addToFavorites(_:)),
+             #selector(toggleSplit(_:)):
+            return windowIsOpen && store.focusedTabID != nil
+        case #selector(nextTab(_:)), #selector(previousTab(_:)), #selector(selectTabByPosition(_:)),
+             #selector(nextSpace(_:)), #selector(previousSpace(_:)), #selector(selectSpaceByPosition(_:)),
+             #selector(toggleSidebar(_:)), #selector(newFolder(_:)), #selector(editSpace(_:)), #selector(showArchive(_:)):
+            return windowIsOpen
+        default:
+            return true
+        }
     }
 }
